@@ -38,7 +38,7 @@ matplotlib.use("AGG")
 import matplotlib.pyplot as plt
 import numpy as np
 import tempfile
-from mindsensors import ABSIMU
+from MsDevices import AbsoluteIMU
 
 plt.figure(figsize=(4,3), dpi=80)
 plt.title('AbsoluteIMU Compass Heading')
@@ -49,8 +49,7 @@ sub.set_theta_direction(-1)
 sub.set_rticks([]) # hide ticks
 tau = 2*np.pi
 
-imu = ABSIMU()
-psm.BAS1.activateCustomSensorI2C()
+imu = AbsoluteIMU(psm.BAS1)
 image = tempfile.NamedTemporaryFile()
 
 while psm.getKeyPressCount() < 1:

@@ -312,7 +312,14 @@ class PSSensor():
         if(self.sensornum == 2):
             return self.bank.readByte(PiStormsCom.PS_S2EV_Ready)
     def activateCustomSensorI2C(self):
-        self.setType(self.PS_SENSOR_TYPE_CUSTOM)
+        # Always write the mode register — the PiStorms board silently resets
+        # the port to NONE after ~1s of inactivity, but PSSensor.setType caches
+        # the type and would otherwise skip the re-write.
+        self.type = self.PS_SENSOR_TYPE_CUSTOM
+        if(self.sensornum == 1):
+            self.bank.writeByte(PiStormsCom.PS_S1_Mode, self.PS_SENSOR_TYPE_CUSTOM)
+        if(self.sensornum == 2):
+            self.bank.writeByte(PiStormsCom.PS_S2_Mode, self.PS_SENSOR_TYPE_CUSTOM)
 
 
 class PSMotor():

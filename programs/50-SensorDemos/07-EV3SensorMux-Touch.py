@@ -22,7 +22,7 @@
 
 from PiStorms import PiStorms
 import time
-from mindsensors import EV3SensAdapt
+from MsDevices import EV3SensAdapt
 
 psm = PiStorms()
 
@@ -32,16 +32,12 @@ m = ["EV3 SensorMux demo", "Connect EV3 Sensor Mux to BAS1",
  "and Press OK to continue"]
 psm.screen.askQuestion(m,["OK"])
 
-# the Mux is an i2c device, so activate the i2c line on that port.
-psm.BAS1.activateCustomSensorI2C()
-
-
 # create our mux object for Channel C1
 #Channel addresses as follows:
 #Channel 1: 0xA0
 #Channel 2: 0xA2
 #Channel 3: 0xA4
-muxC1=EV3SensAdapt(0xA0)
+muxC1 = EV3SensAdapt(psm.BAS1, 0xA0)
 
 doExit = False
 psm.screen.termPrintAt(8, "Press GO button to exit")

@@ -71,6 +71,7 @@
 #
 #
 
+import subprocess
 import threading
 
 from PiStormsCom import PiStormsCom
@@ -909,6 +910,25 @@ class PiStorms:
     #  psm.Shutdown()
     #  @endcode
     def Shutdown(self):
+        # 1. Flush bash history (best-effort)
+        real_user = os.getenv("SUDO_USER") or os.getenv("USER") or "robot"
+        try:
+            subprocess.run(
+                ["sudo", "-u", real_user, "bash", "-c", "history -a"],
+                timeout=5
+            )
+        except Exception as e:
+            print(f"History flush failed: {e}")
+
+        # 2. Flush everything to disk
+        subprocess.run(["/usr/bin/sync"], timeout=10)
+        subprocess.run(["/usr/bin/journalctl", "--flush"], timeout=5)
+
+        # 3. Signal systemd — OS starts shutting down immediately
+        subprocess.run(["/bin/systemctl", "poweroff"])
+
+        # 4. Start PiStorms countdown after OS shutdown is initiated,
+        #    giving the OS the full countdown window to halt cleanly
         self.psc.Shutdown()
 
     ## Returns the input battery voltage

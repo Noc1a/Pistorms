@@ -39,7 +39,7 @@ matplotlib.use("AGG")
 import matplotlib.pyplot as plt
 import numpy as np
 import tempfile
-from mindsensors import ABSIMU
+from MsDevices import AbsoluteIMU
 import time
 
 plt.figure(figsize=(4,3), dpi=80)
@@ -55,13 +55,12 @@ plt.plot(data.T) # transpose
 axis = plt.gca() # get current axis
 axis.set_xticklabels([]) # hide x-axis tick labels
 
-imu = ABSIMU()
-psm.BAS1.activateCustomSensorI2C()
+imu = AbsoluteIMU(psm.BAS1)
 image = tempfile.NamedTemporaryFile()
 
 while psm.getKeyPressCount() < 1:
-    tilt = imu.get_tiltall()[0] # read the x, y, and z tilt data
-    if tilt == ('','',''):
+    tilt = imu.get_tiltall()
+    if tilt is None:
         answer = psm.screen.askQuestion(["AbsoluteIMU not found!", "Please connect an AbsoluteIMU sensor", "to BAS1."], ["OK", "Cancel"], goBtn=True)
         if answer != 0: break
         continue # try again after you tap "OK" or press GO

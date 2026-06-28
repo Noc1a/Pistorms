@@ -43,7 +43,7 @@ import numpy as np
 from scipy.interpolate import spline
 import threading, time
 from PIL import Image
-from mindsensors import ABSIMU
+from MsDevices import AbsoluteIMU
 
 DATA_SIZE = 80 # only the latest n data points will be shown on screen (this is not a cap on how much data will be recorded in total)
 
@@ -61,8 +61,7 @@ axis.set_xticklabels([]) # hide x-axis tick labels
 #axis.set_color_cycle(['red', 'green', 'blue'])
 smooth_x = np.linspace(0, DATA_SIZE-1, 247) # the x-axis for the smoothed lines
 
-imu = ABSIMU()
-psm.BAS1.activateCustomSensorI2C() # attach AbsoluteIMU to BAS1, or change this line
+imu = AbsoluteIMU(psm.BAS1)
 
 canvas = plt.get_current_fig_manager().canvas # used to quickly redraw the screen
 disp = psm.screen.disp # just shorthand
@@ -71,8 +70,8 @@ stop = False
 def captureData():
     global data, stop
     while psm.getKeyPressCount() < 1:
-        tilt = imu.get_tiltall()[0] # read the x, y, and z tilt data
-        if tilt == ('','',''):
+        tilt = imu.get_tiltall()
+        if tilt is None:
             answer = psm.screen.askQuestion(["AbsoluteIMU not found!", "Please connect an AbsoluteIMU sensor", "to BAS1."], ["OK", "Cancel"], goBtn=True)
             if answer != 0: break
         else:

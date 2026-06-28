@@ -26,18 +26,17 @@
 
 #initial setup code
 import os,sys,inspect,time,threading, random
-from mindsensors_i2c import mindsensors_i2c
 from PiStorms import PiStorms
-from mindsensors import ABSIMU
+from MsDevices import AbsoluteIMU
 
 currentdir = os.path.dirname(os.path.abspath(inspect.getfile(inspect.currentframe())))
 parentdir = os.path.dirname(currentdir)
-sys.path.insert(0,parentdir) 
+sys.path.insert(0,parentdir)
 
 #starts an instance of PiStorms
 
-imu=ABSIMU()
 psm = PiStorms()
+imu = AbsoluteIMU(psm.BBS1)
 #exit variable will be used later to exit the program and return to PiStormsMaster
 exit = False
 
@@ -49,7 +48,6 @@ psm.screen.termPrintln("AbsImu on port BBS1 ")
 psm.led(1, 0,0,0)
 psm.led(2, 0,0,0)
 
-psm.BBS1.activateCustomSensorI2C() #Connect the I2C sensor on the port BBS1
 #main loop
 # This test program will print IMU data on Terminal 
 # Compass heading is represented on Red LED on BANKB 

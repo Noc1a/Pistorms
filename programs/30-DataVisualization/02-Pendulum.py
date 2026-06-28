@@ -40,7 +40,7 @@ matplotlib.use("AGG")
 import matplotlib.pyplot as plt
 import numpy as np
 import tempfile
-from mindsensors import ABSIMU
+from MsDevices import AbsoluteIMU
 import threading, time
 
 plt.figure(figsize=(4,3), dpi=80)
@@ -49,8 +49,7 @@ plt.ylabel('acceleration')
 plt.title('AbsoluteIMU Pendulum')
 plt.grid(True)
 
-imu = ABSIMU()
-psm.BAS1.activateCustomSensorI2C() # see example in 50-SensorDemos
+imu = AbsoluteIMU(psm.BAS1)
 
 data = np.empty(0, dtype="int_") # data starts completely empty (signed integer data type)
 
@@ -70,9 +69,9 @@ def captureData():
     global data, stop # share the data and stop variables from the global namespace
     while psm.getKeyPressCount() < 1:
         try:
-            accel = imu.get_accely() + imu.get_accelx() # acceleration in the x+y direction
-            if accel == '': raise TypeError("AbsoluteIMU not connected to BAS1")
-            if accel > 3000: raise ValueError("AbsoluteIMU returned a crazy value")
+            accel = imu.get_accely() + imu.get_accelx() # acceleration in the x+y direction (m/s²)
+            if accel is None: raise TypeError("AbsoluteIMU not connected to BAS1")
+            if accel > 30: raise ValueError("AbsoluteIMU returned a crazy value")
             data = np.append(data, accel) # add the new (valid) data to the data array
         except TypeError:
             answer = psm.screen.askQuestion(["AbsoluteIMU not found!", "Please connect an AbsoluteIMU sensor", "to BAS1."], ["OK", "Cancel"], goBtn=True)

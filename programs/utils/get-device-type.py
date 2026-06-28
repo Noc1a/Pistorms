@@ -34,10 +34,7 @@ import configparser
 config = configparser.RawConfigParser()
 config.read("/usr/local/mindsensors/conf/msdev.cfg")
 
-if "GRX" in comm.GetDeviceFeatures().upper():
-    config.set('msdev', 'device', 'PiStorms-GRX')
-else:
-    config.set('msdev', 'device', 'PiStorms')
+config.set('msdev', 'device', 'PiStorms')
 
 with open("/usr/local/mindsensors/conf/msdev.cfg", 'w') as configfile:
     config.write(configfile)

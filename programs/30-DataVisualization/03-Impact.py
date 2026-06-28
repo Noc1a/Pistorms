@@ -35,7 +35,7 @@ matplotlib.use("AGG")
 import matplotlib.pyplot as plt
 import numpy as np
 import tempfile
-from mindsensors import ABSIMU
+from MsDevices import AbsoluteIMU
 import threading, time
 
 plt.figure(figsize=(4,3), dpi=80)
@@ -44,8 +44,7 @@ plt.ylabel('acceleration')
 plt.title('AbsoluteIMU Car Impact')
 plt.grid(True)
 
-imu = ABSIMU()
-psm.BAS1.activateCustomSensorI2C()
+imu = AbsoluteIMU(psm.BAS1)
 
 datax = np.empty(0, dtype="int_")
 datay = np.empty(0, dtype="int_")
@@ -55,12 +54,12 @@ stop = False
 def captureData():
     global datax, datay, dataz, stop
     while psm.getKeyPressCount() < 1:
-        accel = imu.get_accelall()[0]
-        if accel == ('','',''):
+        accel = imu.get_accelall()
+        if accel is None:
             answer = psm.screen.askQuestion(["AbsoluteIMU not found!", "Please connect an AbsoluteIMU sensor", "to BAS1."], ["OK", "Cancel"], goBtn=True)
             if answer != 0: break
         # append the data, but only if x, y, and z are all reasonable measurements (not something crazy like over 30,000)
-        if all(accel[i] < 30000 for i in range(3)):
+        if all(accel[i] < 300 for i in range(3)):  # 300 m/s² ≈ 30g sanity cap
             datax = np.append(datax, accel[0])
             datay = np.append(datay, accel[1])
             dataz = np.append(dataz, accel[2])

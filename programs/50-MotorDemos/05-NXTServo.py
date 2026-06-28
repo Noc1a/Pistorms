@@ -25,13 +25,12 @@
 #
 
 from PiStorms import PiStorms
-from mindsensors import NXTSERVO
+from MsDevices import NXTServo
 import time
 
 psm = PiStorms()
-psm.BAS1.activateCustomSensorI2C()
 
-nxt_servo = NXTSERVO()
+nxt_servo = NXTServo(psm.BAS1)
 
 m = ["NXTServo Example",
      "Connect NXTServo to BAS1.",
