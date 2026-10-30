@@ -192,7 +192,7 @@ class Camera(Sensor):
                             'x': int(x), 'y': int(y), 'w': int(w), 'h': int(h),
                             'label': label, 'score': float(scores[i]),
                         })
-                        if label == "person":
+                        if label == self.state.follow_target:
                             self.state.targetPose.pose_timestamp = time.monotonic()
                             self.state.targetPose.x = int(x + (w // 2) - Camera.CAM_WIDTH // 2)
                             ratio = self.state.targetPose.x / (Camera.CAM_WIDTH / 2)
@@ -209,38 +209,53 @@ class Lidar(Sensor):
         self.portName = portName
         self.lidar = RPLidar(self.portName)
 
+    def _reconnect(self):
+        """Reset the lidar cleanly — used after a stale/corrupt session leaves
+        get_health() returning a 3-tuple that the library can't unpack."""
+        try: self.lidar.stop()
+        except Exception: pass
+        try: self.lidar.disconnect()
+        except Exception: pass
+        time.sleep(1.0)
+        self.lidar = RPLidar(self.portName)
+
     def run(self):
+        # max_buf_meas: larger buffer tolerates brief consumer stalls without warnings
+        backoff = 1.0
         while self.state.running:
-            for _, scan in enumerate(self.lidar.iter_scans()):
-                if not self.state.running:
-                    break
+            try:
+                for scan in self.lidar.iter_scans(max_buf_meas=6000):
+                    backoff = 1.0  # got a scan — reset backoff
+                    if not self.state.running:
+                        break
 
-                min_target_distance = float('inf')
-                min_front_distance  = float('inf')
+                    min_target_distance = float('inf')
+                    min_front_distance  = float('inf')
+                    lidar_target_angle  = self.state.targetPose.get_angle_deg() % 360
 
-                lidar_target_angle = self.state.targetPose.get_angle_deg() % 360
+                    for (quality, angle, distance) in scan:
+                        if quality == 0 or distance <= 0:
+                            continue
+                        angle_diff = abs((angle - lidar_target_angle + 180) % 360 - 180)
+                        if angle_diff <= 5 and distance < 2000:
+                            min_target_distance = min(min_target_distance, distance)
+                        is_front = angle <= 10 or angle >= 350
+                        if is_front and distance < 300:
+                            min_front_distance = min(min_front_distance, distance)
 
-                for (quality, angle, distance) in scan:
-                    if quality == 0 or distance <= 0:
-                        continue
+                    self.state.last_scan = [[q, a, d] for q, a, d in scan]
+                    self.state.targetDistance        = min_target_distance if min_target_distance != float('inf') else None
+                    self.state.frontObstacleDistance = min_front_distance  if min_front_distance  != float('inf') else None
+            except Exception as e:
+                if not self.state.running: break
+                print(f"Lidar error: {e!r} — reconnecting in {backoff:.1f}s")
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 15.0)
+                try: self._reconnect()
+                except Exception as e2:
+                    print(f"Lidar reconnect failed: {e2!r}")
 
-                    angle_diff = abs((angle - lidar_target_angle + 180) % 360 - 180)
-                    if angle_diff <= 5 and distance < 2000:
-                        min_target_distance = min(min_target_distance, distance)
-
-                    is_front = angle <= 10 or angle >= 350
-                    if is_front and distance < 300:
-                        min_front_distance = min(min_front_distance, distance)
-
-                self.state.last_scan = [[q, a, d] for q, a, d in scan]
-
-                self.state.targetDistance        = min_target_distance if min_target_distance != float('inf') else None
-                self.state.frontObstacleDistance = min_front_distance  if min_front_distance  != float('inf') else None
-
-                if self.state.targetDistance is not None and self.state.frontObstacleDistance is not None:
-                    print(f"LIDAR scan: Target dist={self.state.targetDistance:.1f} mm | "
-                          f"Front obstacle={self.state.frontObstacleDistance:.1f} mm | "
-                          f"Target angle={self.state.targetPose.get_angle_deg():.1f}°")
-
-        self.lidar.stop()
-        self.lidar.disconnect()
+        try: self.lidar.stop()
+        except Exception: pass
+        try: self.lidar.disconnect()
+        except Exception: pass

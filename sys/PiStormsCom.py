@@ -339,34 +339,71 @@ class PSMotor():
             self.bank.writeByte(PiStormsCom.PS_Command, 114)
         elif(self.motornum == 2):
             self.bank.writeByte(PiStormsCom.PS_Command, 115)
+
+    # ── firmware tacho-setpoint reset ────────────────────────────────────────
+    # The PiStorms firmware keeps a latched tacho setpoint from the previous
+    # move. When a fresh speed cmd is issued in a new direction (from stop OR
+    # reversing sign), the position PID briefly pulls the wheel toward that
+    # stale target before the speed loop wins — the "~1 s wrong-way twitch".
+    # Writing SetPoint with TACHO+RELATIVE+GO (a runDegs(0) burst) arms the PID
+    # with target = current position, effectively clearing the stale state.
+    # SPEED-only writes to Speed register don't clear it — the TACHO bit must
+    # be exercised. Once cleared, the actual setSpeed / sync-fire overrides.
+    @staticmethod
+    def _needs_reset(prev, new):
+        if new == 0:
+            return False
+        return prev == 0 or prev * new < 0
+
+    def _reset_setpoint_m1(self):
+        ctrl = (PiStormsCom.PS_CONTROL_SPEED | PiStormsCom.PS_CONTROL_TACHO
+                | PiStormsCom.PS_CONTROL_RELATIVE | PiStormsCom.PS_CONTROL_GO)
+        self.bank.writeArray(PiStormsCom.PS_SetPoint_M1, [0, 0, 0, 0, 100, 0, 0, ctrl])
+
+    def _reset_setpoint_m2(self):
+        ctrl = (PiStormsCom.PS_CONTROL_SPEED | PiStormsCom.PS_CONTROL_TACHO
+                | PiStormsCom.PS_CONTROL_RELATIVE | PiStormsCom.PS_CONTROL_GO)
+        self.bank.writeArray(PiStormsCom.PS_SetPoint_M2, [0, 0, 0, 0, 100, 0, 0, ctrl])
+
     def setSpeedSync(self, speed):
+        if self._needs_reset(self._speed_M1, speed): self._reset_setpoint_m1()
+        if self._needs_reset(self._speed_M2, speed): self._reset_setpoint_m2()
         ctrl = PiStormsCom.PS_CONTROL_SPEED
         array = [int(speed), 0, 0, ctrl]
         self.bank.writeArray(PiStormsCom.PS_Speed_M1, array)
         self.bank.writeArray(PiStormsCom.PS_Speed_M2, array)
         self._speed_M1 = speed
         self._speed_M2 = speed
-        # issue command 'S'
         self.bank.writeByte(PiStormsCom.PS_Command, PiStormsCom.S)
 
-    def setSpeedSyncOpposite(self, speed):
-
+    def setSpeedSyncPair(self, speed_m1, speed_m2):
+        """Write both motor speeds and fire them together with 'S'.
+        Bypasses PS_CONTROL_GO so neither motor starts until the 'S' command,
+        eliminating the I2C-transaction delay between the two writes that
+        otherwise makes one wheel start visibly later than the other."""
+        if self._needs_reset(self._speed_M1, speed_m1): self._reset_setpoint_m1()
+        if self._needs_reset(self._speed_M2, speed_m2): self._reset_setpoint_m2()
         ctrl = PiStormsCom.PS_CONTROL_SPEED
-        
-        # Motor 1: Forward
+        self.bank.writeArray(PiStormsCom.PS_Speed_M1, [int(speed_m1), 0, 0, ctrl])
+        self.bank.writeArray(PiStormsCom.PS_Speed_M2, [int(speed_m2), 0, 0, ctrl])
+        self._speed_M1 = speed_m1
+        self._speed_M2 = speed_m2
+        self.bank.writeByte(PiStormsCom.PS_Command, PiStormsCom.S)
+        sig = (int(speed_m1), int(speed_m2))
+        if sig != getattr(self, '_last_sync_sig', None):
+            print(f"[SYNC] M1={int(speed_m1):+4d} M2={int(speed_m2):+4d}", flush=True)
+            self._last_sync_sig = sig
+
+    def setSpeedSyncOpposite(self, speed):
+        if self._needs_reset(self._speed_M1, speed): self._reset_setpoint_m1()
+        if self._needs_reset(self._speed_M2, -speed): self._reset_setpoint_m2()
+        ctrl = PiStormsCom.PS_CONTROL_SPEED
         array_M1 = [int(speed), 0, 0, ctrl]
-        # Motor 2: Backward (Negative Speed)
         array_M2 = [int(-speed), 0, 0, ctrl]
-        
-        # Write to the registers (this prepares the motors but doesn't start them yet)
         self.bank.writeArray(PiStormsCom.PS_Speed_M1, array_M1)
         self.bank.writeArray(PiStormsCom.PS_Speed_M2, array_M2)
-        
-        # Update internal state tracking
         self._speed_M1 = speed
         self._speed_M2 = -speed
-        
-        # Issue the 'S' (Sync/Start) command to fire both motors at the exact same time
         self.bank.writeByte(PiStormsCom.PS_Command, PiStormsCom.S)
 
     def floatSync(self):
@@ -382,6 +419,10 @@ class PSMotor():
         if(speed == 0):
             self.float()
             return
+        if self.motornum == 1:
+            if self._needs_reset(self._speed_M1, speed): self._reset_setpoint_m1()
+        elif self.motornum == 2:
+            if self._needs_reset(self._speed_M2, speed): self._reset_setpoint_m2()
         ctrl = PiStormsCom.PS_CONTROL_SPEED | PiStormsCom.PS_CONTROL_GO
         array = [int(speed), 0, 0, ctrl]
         if (self.motornum == 1):
@@ -424,6 +465,10 @@ class PSMotor():
             self.bank.writeByte(PiStormsCom.PS_CMDA_M2, ctrl)
             self._speed_M2 = 0
     def runSecs(self, secs, speed, brakeOnCompletion=False):
+        if self.motornum == 1:
+            if self._needs_reset(self._speed_M1, speed): self._reset_setpoint_m1()
+        elif self.motornum == 2:
+            if self._needs_reset(self._speed_M2, speed): self._reset_setpoint_m2()
         ctrl = PiStormsCom.PS_CONTROL_SPEED | \
                PiStormsCom.PS_CONTROL_TIME | \
                PiStormsCom.PS_CONTROL_GO
@@ -431,10 +476,10 @@ class PSMotor():
             ctrl |= PiStormsCom.PS_CONTROL_BRK
         array = [speed, secs, 0, ctrl]
         if(self.motornum == 1):
-            self.bank.writeArray(PiStormsCom.PS_Speed_M1,array)
+            self.bank.writeArray(PiStormsCom.PS_Speed_M1, array)
             self._speed_M1 = speed
         if(self.motornum == 2):
-            self.bank.writeArray(PiStormsCom.PS_Speed_M2,array)
+            self.bank.writeArray(PiStormsCom.PS_Speed_M2, array)
             self._speed_M2 = speed
     def status(self):
         if(self.motornum == 1):
@@ -695,6 +740,18 @@ class PiStormsCom(object):
         else:
             self.bankA.writeByte(self.PS_Command,self.R)
             self.bankB.writeByte(self.PS_Command,self.R)
+            # Clear the firmware's stale tacho setpoint on all four motors at
+            # boot — without this, the very first setSpeed after power-on can
+            # produce a wrong-way twitch identical to the stop-then-reverse
+            # case. See PSMotor._reset_setpoint_m1 comment for the mechanism.
+            try:
+                time.sleep(0.05)
+                self.BAM1._reset_setpoint_m1()
+                self.BAM1._reset_setpoint_m2()
+                self.BBM1._reset_setpoint_m1()
+                self.BBM1._reset_setpoint_m2()
+            except Exception as e:
+                print(f"Motor setpoint reset failed at init: {e}")
 
         config = configparser.RawConfigParser()
         config.read("/usr/local/mindsensors/conf/msdev.cfg")

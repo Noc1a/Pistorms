@@ -14,6 +14,10 @@ class Pose:
 
 
 class RobotState:
+    MODE_MANUAL = 'manual'
+    MODE_FOLLOW = 'follow'
+    MODE_HOME   = 'home'
+
     def __init__(self, running):
         self.pose = Pose(0, 0, 0.0)
         self.targetPose = Pose(0, 0, 0.0)
@@ -26,3 +30,7 @@ class RobotState:
         self.last_scan = []          # [[quality, angle, distance], ...]
         self.last_detections = []    # [{'x','y','w','h','label','score'}, ...]
         self.last_frame = None       # latest camera frame as JPEG bytes
+        # control mode (written by web, read by main control loop)
+        self.mode = RobotState.MODE_MANUAL
+        self.manual_cmd = {'fwd': 0.0, 'turn': 0.0, 'speed': 30}   # -1..1, -1..1, 0..100
+        self.follow_target = 'person'
