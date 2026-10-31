@@ -946,6 +946,9 @@ class PiStorms:
     #  @param self The object pointer.
     #  @param name The display title that will appear at the top of the LCD touchscreen.
     #  @param rotation The rotation of the LCD touchscreen.
+    #  @param reset Reset the motors/encoders, clear the LCD and the GO-button
+    #  count. Pass False from background scripts (battery monitor, loggers)
+    #  so starting them doesn't disturb a robot program that is already running.
     #  @remark
     #  There is no need to use this function directly. To initialize the PiStorms class in your program:
     #  @code
@@ -953,12 +956,12 @@ class PiStorms:
     #  ...
     #  psm = PiStorms()
     #  @endcode
-    def __init__(self, name = "PiStorms", rotation = 3 ):
+    def __init__(self, name = "PiStorms", rotation = 3, reset = True):
 
-        ## An instance of mindsensorsUI.mindsensorsUI representing the PiStorms's touchscreen.
-        self.screen = mindsensorsUI(name, rotation)
         ## An instance of PiStormsCom.PiStormsCom.
-        self.psc = PiStormsCom()
+        self.psc = PiStormsCom(reset=reset)
+        ## An instance of mindsensorsUI.mindsensorsUI representing the PiStorms's touchscreen.
+        self.screen = mindsensorsUI(name, rotation, comm=self.psc, clear=reset)
         ## An instance of PiStormsSensor representing Bank A sensor 1.
         self.BAS1 = PiStormsSensor(self.psc.BAS1)
         ## An instance of PiStormsSensor representing Bank A sensor 2.
@@ -977,7 +980,8 @@ class PiStorms:
         ## An instance of PiStormsMotor representing Bank B motor 2.
         self.BBM2 = PiStormsMotor(self.psc.BBM2)
 
-        self.psc.resetKeyPressCount()
+        if reset:
+            self.psc.resetKeyPressCount()
 
     def command (self, cmd, bank):
         self.psc.command(cmd, bank)

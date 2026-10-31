@@ -30,6 +30,7 @@ class RobotState:
         self.last_scan = []          # [[quality, angle, distance], ...]
         self.last_detections = []    # [{'x','y','w','h','label','score'}, ...]
         self.last_frame = None       # latest camera frame as JPEG bytes
+        self.last_frame_request = float('-inf')   # monotonic time a viewer last asked for a frame
         # control mode (written by web, read by main control loop)
         self.mode = RobotState.MODE_MANUAL
         self.manual_cmd = {'fwd': 0.0, 'turn': 0.0, 'speed': 30}   # -1..1, -1..1, 0..100

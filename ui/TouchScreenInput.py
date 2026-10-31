@@ -96,6 +96,12 @@ class TouchScreenInput:
         self.scrn.refresh()
         return keys
 
+    def _wait_release(self):
+        """Block until the finger lifts, so one press = one key (no auto-repeat,
+        no Shift toggling on and off while held)."""
+        while self.scrn.isTouched():
+            time.sleep(0.02)
+
     def getInput(self, hide=False):
         if self.led_off_func is not None:
             self.led_off_func()
@@ -125,30 +131,36 @@ class TouchScreenInput:
 
         toSubmit = {}
         while not exit:
-            # ── Read control row ──────────────────────────────────────────────
-            shft = self.scrn.checkButton(0 * _CTL_W, _CTL_Y, _CTL_W, _CTL_H)
-            abc  = self.scrn.checkButton(1 * _CTL_W, _CTL_Y, _CTL_W, _CTL_H)
-            sym  = self.scrn.checkButton(2 * _CTL_W, _CTL_Y, _CTL_W, _CTL_H)
-            num  = self.scrn.checkButton(3 * _CTL_W, _CTL_Y, _CTL_W, _CTL_H)
-            clr  = self.scrn.checkButton(4 * _CTL_W, _CTL_Y, _CTL_W, _CTL_H)
-            bsp  = self.scrn.checkButton(5 * _CTL_W, _CTL_Y, _CTL_W, _CTL_H)
-            prev = self.scrn.checkButton(6 * _CTL_W, _CTL_Y, _CTL_W, _CTL_H)
-            nxt  = self.scrn.checkButton(7 * _CTL_W, _CTL_Y, _CTL_W, _CTL_H)
+            # ── Read the touchscreen ONCE per loop ────────────────────────────
+            # (each read is a dozen I²C transactions; checking 34 buttons with
+            # a fresh read each flooded the bus shared with odometry)
+            if not self.scrn.isTouched():
+                time.sleep(0.05)
+                continue
+            tx, ty = self.scrn.x, self.scrn.y
 
-            # ── Read header ───────────────────────────────────────────────────
-            cancel = self.scrn.checkButton(0,      _HDR_Y, _HDR_W, _HDR_H)
-            submit = self.scrn.checkButton(_HDR_W, _HDR_Y, _HDR_W, _HDR_H)
+            def hit(x, y, width, height):
+                return x <= tx <= x + width and y <= ty <= y + height
 
-            # ── Read 24 letter buttons (row-major) ────────────────────────────
-            letter_hits = []
-            for row in range(_LTR_ROWS):
-                for col in range(_LTR_COLS):
-                    letter_hits.append(
-                        self.scrn.checkButton(
-                            _LM + col * _W, _LTR_Y + row * (_LTR_H + _LTR_G),
-                            _W, _LTR_H
-                        )
-                    )
+            # ── Control row ───────────────────────────────────────────────────
+            shft = hit(0 * _CTL_W, _CTL_Y, _CTL_W, _CTL_H)
+            abc  = hit(1 * _CTL_W, _CTL_Y, _CTL_W, _CTL_H)
+            sym  = hit(2 * _CTL_W, _CTL_Y, _CTL_W, _CTL_H)
+            num  = hit(3 * _CTL_W, _CTL_Y, _CTL_W, _CTL_H)
+            clr  = hit(4 * _CTL_W, _CTL_Y, _CTL_W, _CTL_H)
+            bsp  = hit(5 * _CTL_W, _CTL_Y, _CTL_W, _CTL_H)
+            prev = hit(6 * _CTL_W, _CTL_Y, _CTL_W, _CTL_H)
+            nxt  = hit(7 * _CTL_W, _CTL_Y, _CTL_W, _CTL_H)
+
+            # ── Header ────────────────────────────────────────────────────────
+            cancel = hit(0,      _HDR_Y, _HDR_W, _HDR_H)
+            submit = hit(_HDR_W, _HDR_Y, _HDR_W, _HDR_H)
+
+            # ── 24 letter buttons (row-major) ─────────────────────────────────
+            letter_hits = [
+                hit(_LM + col * _W, _LTR_Y + row * (_LTR_H + _LTR_G), _W, _LTR_H)
+                for row in range(_LTR_ROWS) for col in range(_LTR_COLS)
+            ]
 
             # ── Layout controls ───────────────────────────────────────────────
             if   shft: upper = not upper
@@ -162,6 +174,7 @@ class TouchScreenInput:
 
             if shft or abc or sym or num or prev or nxt:
                 keys = self.redraw(layout, index)
+                self._wait_release()
                 continue
 
             # ── Text input ────────────────────────────────────────────────────
@@ -187,6 +200,7 @@ class TouchScreenInput:
 
             if clr or bsp or any(h and keys[i] for i, h in enumerate(letter_hits)):
                 self.update_textbox(usr_input, hide)
+                self._wait_release()
                 continue
 
             # ── Exit ──────────────────────────────────────────────────────────

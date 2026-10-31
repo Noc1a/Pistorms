@@ -30,14 +30,18 @@ class mindsensorsUI():
     PS_MODE_POPUP = 1
     PS_MODE_DEAD = 2
 
-    def __init__(self, name="PiStorms", rotation=3):
+    def __init__(self, name="PiStorms", rotation=3, comm=None, clear=True):
         """
         Initializes the UI device using the Framebuffer /dev/fb1.
         @param name: Display title (for compatibility).
         @param rotation: Screen rotation (0-3).
+        @param comm: PiStormsCom to read the touchscreen through. PiStorms
+                     passes its own; a standalone UI opens one WITHOUT the
+                     motor reset (the UI only needs the touchscreen).
+        @param clear: Clear the LCD on init.
         """
         self.fb_path = "/dev/fb1"
-        self.comm = PiStormsCom()
+        self.comm = comm if comm is not None else PiStormsCom(reset=False)
         self.currentRotation = rotation
         self.currentMode = self.PS_MODE_TERMINAL
         
@@ -57,8 +61,9 @@ class mindsensorsUI():
         # Most FB1 drivers for PiStorms are set to 320x240
         self.buffer = Image.new("RGB", (320, 240))
         self.draw = ImageDraw.Draw(self.buffer)
-        
-        self.clearScreen()
+
+        if clear:
+            self.clearScreen()
 
     def refresh(self):
         """

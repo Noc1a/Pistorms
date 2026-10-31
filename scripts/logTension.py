@@ -10,13 +10,16 @@ from PiStorms import PiStorms
 LOGFILE = "/home/robot/voltage_log.txt"
 INTERVAL = 5  # secondes
 
-psm = PiStorms()
+psm = PiStorms(reset=False)  # ne pas réinitialiser les moteurs d'un programme en cours
 
 with open(LOGFILE, "a", buffering=1) as f:  # buffering=1 = line buffered
     f.write(f"=== Log démarré {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
     while True:
         voltage = psm.battVoltage()
-        line = f"{time.strftime('%H:%M:%S')}  {voltage:.3f} V\n"
+        if voltage is None:
+            line = f"{time.strftime('%H:%M:%S')}  erreur de lecture I2C\n"
+        else:
+            line = f"{time.strftime('%H:%M:%S')}  {voltage:.3f} V\n"
         f.write(line)
         print(line, end="")
         time.sleep(INTERVAL)

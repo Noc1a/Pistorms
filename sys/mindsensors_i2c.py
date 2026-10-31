@@ -30,6 +30,25 @@
 
 import smbus
 import ctypes
+import time
+
+# Transient bus errors (e.g. Errno 121 Remote I/O) are common on the PiStorms
+# bus while motors run. Every transaction is retried this many times before
+# the error is raised to the caller — never silently swallowed, because a
+# swallowed read used to surface as None (→ fake 0 V battery, dead odometry
+# thread) and a swallowed write could drop a brake command.
+I2C_RETRIES     = 3
+I2C_RETRY_DELAY = 0.002   # s
+SMBUS_BLOCK_MAX = 32      # smbus block transfers are limited to 32 bytes
+
+def _with_retries(fn, *args):
+    for attempt in range(I2C_RETRIES):
+        try:
+            return fn(*args)
+        except OSError:
+            if attempt == I2C_RETRIES - 1:
+                raise
+            time.sleep(I2C_RETRY_DELAY)
 
 ## mindsensors_i2c: this class provides i2c functions
 #  for read and write operations.
@@ -67,6 +86,9 @@ class mindsensors_i2c(object):
         self.address = i2c_address
         b = mindsensors_i2c.which_bus()
         self.bus = smbus.SMBus(b)
+        # None = not probed yet; True/False = device does/doesn't return the
+        # same bytes for a block read as for individual byte reads.
+        self._block_read_ok = None
         
     ## Prints an error message if a read error is detected
     #  @param self The object pointer.
@@ -78,21 +100,16 @@ class mindsensors_i2c(object):
     #  @param self The object pointer.
     #  @param reg The register to write value at.
     #  @param value Value to write.
+    #  @remark Retries transient bus errors; raises OSError if all retries fail.
     def writeByte(self, reg, value):
-        try:
-            self.bus.write_byte_data(self.address, reg, value)
-        except:
-            pass
-            
+        _with_retries(self.bus.write_byte_data, self.address, reg, value)
+
     ## Read an unsigned byte from your i2c device at a given location
     #  @param self The object pointer.
     #  @param reg The register to read from.
+    #  @remark Retries transient bus errors; raises OSError if all retries fail.
     def readByte(self, reg):
-        try:
-            result = self.bus.read_byte_data(self.address, reg)
-            return (result)
-        except:
-            pass
+        return _with_retries(self.bus.read_byte_data, self.address, reg)
             
     ## Read a signed byte from your i2c device at a given location
     #  @param self The object pointer.
@@ -114,27 +131,56 @@ class mindsensors_i2c(object):
     #  @param self The object pointer.
     #  @param reg The first register in the array to read from.
     #  @param length The length of the array.
+    #  @remark Multi-byte values (encoder counts, gyro rates) must be read in
+    #  one transaction: byte-by-byte, the value can change between bytes and a
+    #  carry across a byte boundary gives a ±256-count glitch. A block read is
+    #  atomic; if the device doesn't support it, two identical byte-by-byte
+    #  passes are required instead. Raises OSError if the bus keeps failing.
     def readArray(self, reg, length):
-        result = []
-        try:
+        if self._block_read_ok is None:
+            self._probe_block_read()
+        if self._block_read_ok:
+            result = []
             while length > 0:
-                result.append(self.readByte(reg))
-                reg = reg+1
-                length = length -1
-            #results = self.bus.read_i2c_block_data(self.address, reg, length)
+                n = min(length, SMBUS_BLOCK_MAX)
+                result += _with_retries(self.bus.read_i2c_block_data, self.address, reg, n)
+                reg += n
+                length -= n
             return result
-        except:
-            pass
+        return self._readArrayConsistent(reg, length)
+
+    def _readArrayBytes(self, reg, length):
+        return [self.readByte(reg + i) for i in range(length)]
+
+    def _readArrayConsistent(self, reg, length):
+        prev = self._readArrayBytes(reg, length)
+        if length == 1:
+            return prev
+        for _ in range(I2C_RETRIES):
+            cur = self._readArrayBytes(reg, length)
+            if cur == prev:
+                return cur
+            prev = cur
+        return prev
+
+    def _probe_block_read(self):
+        """Compare a block read of the (static) version string at 0x00 with
+        byte reads; use block reads only if the device returns the same data."""
+        try:
+            blk = list(self.bus.read_i2c_block_data(self.address, 0x00, 8))
+            self._block_read_ok = (blk == self._readArrayBytes(0x00, 8))
+            if not self._block_read_ok:
+                print("I2C 0x%02X: block read mismatch — using byte reads" % self.address)
+        except OSError:
+            pass   # bus glitch during the probe: stay undecided, retry next call
 
     ## Write a byte array from your i2c device starting at a given location
     #  @param self The object pointer.
     #  @param reg The first register in the array to write to.
     #  @param arr The array to write.
+    #  @remark Retries transient bus errors; raises OSError if all retries fail.
     def writeArray(self, reg, arr):
-        try:
-            self.bus.write_i2c_block_data(self.address, reg, arr)
-        except:
-            pass
+        _with_retries(self.bus.write_i2c_block_data, self.address, reg, arr)
 
     ## Read a string from your i2c device starting at a given location
     #  @param self The object pointer.
@@ -204,15 +250,15 @@ class mindsensors_i2c(object):
     #  @param reg The first register of the first byte of the integer to read.
     def readLongSignedBE(self, reg):
         a = self.readLongBE(reg)
-        signed_a = ctypes.c_long(a).value
-        return signed_a      
-          
+        signed_a = ctypes.c_int32(a).value   # c_long is 64-bit on aarch64
+        return signed_a
+
     ## Read a signed 32bit integer from your i2c device from a given location. little endian read integers .
     #  @param self The object pointer.
     #  @param reg The first register of the first byte of the integer to read.
     def readLongSigned(self, reg):
         a = self.readLong(reg)
-        signed_a = ctypes.c_long(a).value
+        signed_a = ctypes.c_int32(a).value   # c_long is 64-bit on aarch64
         return signed_a
 
     ##  Read the firmware version of the i2c device

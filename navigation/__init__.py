@@ -1,9 +1,9 @@
 from .robot_state import Pose, RobotState
-from .sensor_thread import Sensor, IR, Button, Imu, WheelEncoder, Camera, Lidar
+from .sensor_thread import Sensor, IR, Button, Odometry, Camera, Lidar
 from .two_wheels_driver import Driver
 
 __all__ = [
     'Pose', 'RobotState',
-    'Sensor', 'IR', 'Button', 'Imu', 'WheelEncoder', 'Camera', 'Lidar',
+    'Sensor', 'IR', 'Button', 'Odometry', 'Camera', 'Lidar',
     'Driver',
 ]

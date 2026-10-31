@@ -322,12 +322,54 @@ class PSSensor():
             self.bank.writeByte(PiStormsCom.PS_S2_Mode, self.PS_SENSOR_TYPE_CUSTOM)
 
 
+def _clamp_speed(speed):
+    # smbus keeps only the low byte: an out-of-range speed like -160 would
+    # wrap to +96 and spin the wheel the wrong way.
+    return max(-100, min(100, int(speed)))
+
+
 class PSMotor():
+    STOP_ATTEMPTS = 3   # outer retries for brake/float (each writeByte retries too)
+
     def __init__(self, bank, num=0):
         self.bank = bank
         self.motornum = num
-        self._speed_M1 = 0
-        self._speed_M2 = 0
+        # Last commanded speed of each motor, stored on the BANK — not on this
+        # object — because BAM1 and BAM2 are separate PSMotor objects that
+        # both drive the bank's M1/M2 (sync commands write both). Per-object
+        # copies drifted apart and broke _needs_reset.
+        if not hasattr(bank, 'motor_speeds'):
+            bank.motor_speeds = [0, 0]
+
+    @property
+    def _speed_M1(self):
+        return self.bank.motor_speeds[0]
+
+    @_speed_M1.setter
+    def _speed_M1(self, v):
+        self.bank.motor_speeds[0] = v
+
+    @property
+    def _speed_M2(self):
+        return self.bank.motor_speeds[1]
+
+    @_speed_M2.setter
+    def _speed_M2(self, v):
+        self.bank.motor_speeds[1] = v
+
+    def _stop_command(self, cmd):
+        """Write a brake/float command. Stopping the motors must not be lost to
+        a bus glitch, so retry harder than ordinary writes and log failures."""
+        for attempt in range(self.STOP_ATTEMPTS):
+            try:
+                self.bank.writeByte(PiStormsCom.PS_Command, cmd)
+                return
+            except OSError as e:
+                print(f"Motor stop command 0x{cmd:02X} failed ({e}) "
+                      f"[{attempt + 1}/{self.STOP_ATTEMPTS}]", flush=True)
+                if attempt == self.STOP_ATTEMPTS - 1:
+                    raise
+                time.sleep(0.01)
 
     def pos(self):
         if self.motornum == 1:
@@ -366,6 +408,7 @@ class PSMotor():
         self.bank.writeArray(PiStormsCom.PS_SetPoint_M2, [0, 0, 0, 0, 100, 0, 0, ctrl])
 
     def setSpeedSync(self, speed):
+        speed = _clamp_speed(speed)
         if self._needs_reset(self._speed_M1, speed): self._reset_setpoint_m1()
         if self._needs_reset(self._speed_M2, speed): self._reset_setpoint_m2()
         ctrl = PiStormsCom.PS_CONTROL_SPEED
@@ -381,6 +424,7 @@ class PSMotor():
         Bypasses PS_CONTROL_GO so neither motor starts until the 'S' command,
         eliminating the I2C-transaction delay between the two writes that
         otherwise makes one wheel start visibly later than the other."""
+        speed_m1, speed_m2 = _clamp_speed(speed_m1), _clamp_speed(speed_m2)
         if self._needs_reset(self._speed_M1, speed_m1): self._reset_setpoint_m1()
         if self._needs_reset(self._speed_M2, speed_m2): self._reset_setpoint_m2()
         ctrl = PiStormsCom.PS_CONTROL_SPEED
@@ -395,6 +439,7 @@ class PSMotor():
             self._last_sync_sig = sig
 
     def setSpeedSyncOpposite(self, speed):
+        speed = _clamp_speed(speed)
         if self._needs_reset(self._speed_M1, speed): self._reset_setpoint_m1()
         if self._needs_reset(self._speed_M2, -speed): self._reset_setpoint_m2()
         ctrl = PiStormsCom.PS_CONTROL_SPEED
@@ -407,15 +452,16 @@ class PSMotor():
         self.bank.writeByte(PiStormsCom.PS_Command, PiStormsCom.S)
 
     def floatSync(self):
-        self.bank.writeByte(PiStormsCom.PS_Command,PiStormsCom.c)
+        self._stop_command(PiStormsCom.c)
         self._speed_M1 = 0
         self._speed_M2 = 0
     def brakeSync(self):
         # issue command 'C', break while stopping
-        self.bank.writeByte(PiStormsCom.PS_Command,PiStormsCom.C)
+        self._stop_command(PiStormsCom.C)
         self._speed_M1 = 0
         self._speed_M2 = 0
     def setSpeed(self, speed):
+        speed = _clamp_speed(speed)
         if(speed == 0):
             self.float()
             return
@@ -439,17 +485,17 @@ class PSMotor():
             return self._speed_M2
     def brake(self):
         if(self.motornum == 1):
-            self.bank.writeByte(PiStormsCom.PS_Command, PiStormsCom.A)
+            self._stop_command(PiStormsCom.A)
             self._speed_M1 = 0
         if(self.motornum == 2):
-            self.bank.writeByte(PiStormsCom.PS_Command, PiStormsCom.B)
+            self._stop_command(PiStormsCom.B)
             self._speed_M2 = 0
     def float(self):
         if(self.motornum == 1):
-            self.bank.writeByte(PiStormsCom.PS_Command, PiStormsCom.a)
+            self._stop_command(PiStormsCom.a)
             self._speed_M1 = 0
         if(self.motornum == 2):
-            self.bank.writeByte(PiStormsCom.PS_Command, PiStormsCom.b)
+            self._stop_command(PiStormsCom.b)
             self._speed_M2 = 0
     def hold(self):
         ctrl = PiStormsCom.PS_CONTROL_BRK | \
@@ -505,6 +551,12 @@ class PSMotor():
         return self.statusBit(5)
     def runDegs(self, degs, speed=100, brakeOnCompletion=False, holdOnCompletion=False):
         # holdOnCompletion is not supported on LEGO motors, ignored
+        # Non-blocking: returns once the setpoint is written; use
+        # waitUntilNotBusy() to wait for the move to finish.
+        # smbus only accepts ints — a float here used to raise inside the
+        # (formerly silent) writeArray, so the command was dropped.
+        degs  = int(round(degs))
+        speed = _clamp_speed(speed)
         ctrl = PiStormsCom.PS_CONTROL_SPEED | \
                PiStormsCom.PS_CONTROL_TACHO | \
                PiStormsCom.PS_CONTROL_RELATIVE | \
@@ -732,12 +784,18 @@ class PiStormsCom(object):
     BBS1 = PSSensor(bankB, 1)
     BBS2 = PSSensor(bankB, 2)
 
-    def __init__(self):
+    ## @param reset Reset both banks and clear the motors' tacho setpoints.
+    #  Pass False from monitoring scripts (battery monitor, loggers) that may
+    #  start while a robot program is running: the reset zeroes the encoders
+    #  and stops the motors under that program's feet.
+    def __init__(self, reset=True):
         try:
             self.bankA.readByte(self.PS_BattV)
         except:
             print ("Could not connect to PiStorms.")
         else:
+            if not reset:
+                return
             self.bankA.writeByte(self.PS_Command,self.R)
             self.bankB.writeByte(self.PS_Command,self.R)
             # Clear the firmware's stale tacho setpoint on all four motors at
@@ -766,11 +824,14 @@ class PiStormsCom(object):
         elif(bank == 2):
             self.bankB.writeByte(self.PS_Command,cmd)
 
+    ## Returns the battery voltage in volts, or None if it couldn't be read.
+    #  Never returns 0 on a read error — callers treat low voltage as a reason
+    #  to shut down.
     def battVoltage(self):
         try:
             return self.bankB.readByte(self.PS_BattV)*0.04
-        except:
-            return 0
+        except OSError:
+            return None
 
     def GetFirmwareVersion(self):
         try:

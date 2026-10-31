@@ -58,18 +58,34 @@ class Button(Sensor):
 class Odometry(Sensor):
     """Wheel encoders + gyro Z fused into pose (x, y, angle_rad).
 
+    Pose frame: x forward at start, y to the left, angle CCW-positive
+    (right-handed). All raw sensor signs are corrected here so controllers
+    can use atan2 directly.
+
     Heading: complementary filter — α gyro / (1-α) wheel-differential.
-    Position: average wheel travel projected onto fused heading.
+    Position: average wheel travel projected onto the midpoint heading.
 
     Madgwick + magnetometer were dropped: motor magnetic interference made the
-    mag reference unreliable. Gyro Z handles short-term rotation, encoders bound
-    long-term drift in absence of motion; an absolute reference (e.g. LiDAR scan
-    match) would still be needed for unbounded long-term accuracy."""
+    mag reference unreliable. Blending gyro and wheel increments reduces gyro
+    noise but does NOT bound heading drift; an absolute reference (e.g. LiDAR
+    scan match) is needed for long-term accuracy."""
 
     PERIOD = 0.020         # 50 Hz
     ALPHA  = 0.98          # gyro trust in heading fusion
     TICKS_PER_REV = 360.0
     GYRO_CAL_SAMPLES = 300
+
+    # Sign conventions (measured in tests/testOdometryAccuracy.py):
+    # setSpeed(-N) drives forward, and encoders count in the commanded
+    # direction, so forward motion DECREASES both tick counts.
+    LEFT_TICK_SIGN  = -1
+    RIGHT_TICK_SIGN = -1
+    # The AbsoluteIMU's Z axis points down on this robot: a CCW turn reads
+    # negative gyro Z.
+    GYRO_Z_SIGN     = -1
+    # A larger tick change in one 20 ms sample is physically impossible
+    # (I²C corruption or an encoder reset by another process) — skip it.
+    MAX_TICK_DELTA  = 500
 
     def __init__(self, state: RobotState, imu: AbsoluteIMU,
                  motorLeft: PiStormsMotor, motorRight: PiStormsMotor,
@@ -89,49 +105,93 @@ class Odometry(Sensor):
         for _ in range(self.GYRO_CAL_SAMPLES):
             gyr_z = self.imu.get_gyroz()
             if gyr_z is not None:
-                samples.append(gyr_z)
+                samples.append(gyr_z * self.GYRO_Z_SIGN)
             time.sleep(0.005)
+        if not samples:
+            print("Gyro bias calibration got no samples — assuming 0 deg/s")
+            return 0.0
         bias = math.radians(float(np.mean(samples)))
         print(f"Gyro Z bias: {math.degrees(bias):+.3f} deg/s")
         return bias
 
+    def _read_ticks(self):
+        """Both encoders as forward-positive tick counts, or None on I²C error."""
+        try:
+            return (self.motorLeft.pos()  * self.LEFT_TICK_SIGN,
+                    self.motorRight.pos() * self.RIGHT_TICK_SIGN)
+        except (OSError, TypeError) as e:
+            print(f"Odometry: encoder read failed ({e!r}) — skipping sample")
+            return None
+
+    def _integrate(self, d_left, d_right, gyr_z, dt):
+        """Advance the pose by one sample. d_left/d_right are forward-positive
+        tick deltas; gyr_z is the RAW gyro Z in deg/s (or None)."""
+        # encoder deltas → forward-signed wheel travel (m)
+        dl = d_left  * self.wheel_circumference / self.TICKS_PER_REV
+        dr = d_right * self.wheel_circumference / self.TICKS_PER_REV
+
+        # heading: complementary filter on rotation increments; without
+        # a gyro sample, fall back to wheels only for this step
+        d_theta_odom = (dr - dl) / self.wheel_base
+        if gyr_z is None:
+            d_theta = d_theta_odom
+        else:
+            d_theta_gyro = (math.radians(gyr_z * self.GYRO_Z_SIGN)
+                            - self._gyro_bias_z_rad) * dt
+            d_theta = self.ALPHA * d_theta_gyro + (1 - self.ALPHA) * d_theta_odom
+
+        distance = (dl + dr) / 2.0
+
+        with self.state._pose_lock:
+            heading_mid = self.state.pose.angle_rad + d_theta / 2.0
+            self.state.pose.angle_rad += d_theta
+            self.state.pose.x += distance * cos(heading_mid)
+            self.state.pose.y += distance * sin(heading_mid)
+
     def run(self):
-        self.imu.set_gyro_filter(7)
+        try:
+            self.imu.set_gyro_filter(7)
+        except OSError as e:
+            print(f"Odometry: could not set gyro filter ({e!r})")
         self._gyro_bias_z_rad = self._calibrate_gyro_bias()
 
-        ticks_left_prev  = self.motorLeft.pos()
-        ticks_right_prev = self.motorRight.pos()
+        ticks = None
+        while ticks is None and self.state.running:
+            ticks = self._read_ticks()
+            if ticks is None:
+                time.sleep(self.PERIOD)
+        if ticks is None:
+            return
+        ticks_left_prev, ticks_right_prev = ticks
 
         t0 = time.monotonic()
         while self.state.running:
-            gyr_z = self.imu.get_gyroz()
-            ticks_left  = self.motorLeft.pos()
-            ticks_right = self.motorRight.pos()
+            try:
+                gyr_z = self.imu.get_gyroz()
+                ticks = self._read_ticks()
 
-            now = time.monotonic()
-            dt = now - t0
-            t0 = now
+                now = time.monotonic()
+                dt = now - t0
+                t0 = now
 
-            if gyr_z is None:
-                time.sleep(self.PERIOD)
-                continue
+                if ticks is None:
+                    time.sleep(self.PERIOD)
+                    continue
+                ticks_left, ticks_right = ticks
+                d_left  = ticks_left  - ticks_left_prev
+                d_right = ticks_right - ticks_right_prev
+                ticks_left_prev, ticks_right_prev = ticks_left, ticks_right
+                if abs(d_left) > self.MAX_TICK_DELTA or abs(d_right) > self.MAX_TICK_DELTA:
+                    print(f"Odometry: implausible encoder jump "
+                          f"(dl={d_left}, dr={d_right} ticks) — skipping sample")
+                    time.sleep(self.PERIOD)
+                    continue
 
-            # encoder deltas → wheel travel (m)
-            dl = (ticks_left  - ticks_left_prev)  * self.wheel_circumference / self.TICKS_PER_REV
-            dr = (ticks_right - ticks_right_prev) * self.wheel_circumference / self.TICKS_PER_REV
-            ticks_left_prev, ticks_right_prev = ticks_left, ticks_right
-
-            # heading: complementary filter on rotation increments
-            d_theta_gyro = (math.radians(gyr_z) - self._gyro_bias_z_rad) * dt
-            d_theta_odom = (dr - dl) / self.wheel_base
-            d_theta = self.ALPHA * d_theta_gyro + (1 - self.ALPHA) * d_theta_odom
-
-            distance = (dl + dr) / 2.0
-
-            with self.state._pose_lock:
-                self.state.pose.angle_rad += d_theta
-                self.state.pose.x += distance * cos(self.state.pose.angle_rad)
-                self.state.pose.y += distance * sin(self.state.pose.angle_rad)
+                self._integrate(d_left, d_right, gyr_z, dt)
+            except Exception as e:
+                # never let one bad sample kill the thread: a dead odometry
+                # thread freezes the pose and GoHome would drive forever
+                print(f"Odometry error: {e!r}")
 
             elapsed = time.monotonic() - t0
             time.sleep(max(0.0, self.PERIOD - elapsed))
@@ -160,9 +220,15 @@ class Camera(Sensor):
         )
         self.picam2.configure(config)
 
+    # JPEG-encode preview frames only while a web viewer has asked for one
+    # recently — encoding every frame costs CPU the control loop needs.
+    FRAME_VIEWER_TIMEOUT = 2.0   # s
+
     def run(self):
         def _frame_cb(request):
             try:
+                if time.monotonic() - self.state.last_frame_request > self.FRAME_VIEWER_TIMEOUT:
+                    return
                 arr = request.make_array("main")
                 buf = io.BytesIO()
                 _PILImage.fromarray(arr).save(buf, format='JPEG', quality=65)
@@ -174,33 +240,53 @@ class Camera(Sensor):
         self.picam2.start()
         labels = self.imx500.network_intrinsics.labels
 
-        while self.state.running:
-            metadata = self.picam2.capture_metadata()
-            outputs = self.imx500.get_outputs(metadata, add_batch=True)
+        try:
+            while self.state.running:
+                try:
+                    self._process_frame(labels)
+                except Exception as e:
+                    # one bad inference result must not kill the thread —
+                    # Follow mode would then spin searching forever
+                    print(f"Camera error: {e!r}")
+                    time.sleep(0.1)
+        finally:
+            try: self.picam2.stop()
+            except Exception: pass
+            try: self.picam2.close()
+            except Exception: pass
 
-            if outputs is not None:
-                # SSD outputs: [0]=boxes, [1]=scores, [2]=classes
-                boxes, scores, classes = outputs[0][0], outputs[1][0], outputs[2][0]
+    def _process_frame(self, labels):
+        metadata = self.picam2.capture_metadata()
+        outputs = self.imx500.get_outputs(metadata, add_batch=True)
+        if outputs is None:
+            return
 
-                detections = []
-                for i in range(len(scores)):
-                    if scores[i] > 0.5:
-                        box = boxes[i]
-                        x, y, w, h = self.imx500.convert_inference_coords(box, metadata, self.picam2)
-                        label = labels[int(classes[i])] if labels else str(int(classes[i]))
-                        detections.append({
-                            'x': int(x), 'y': int(y), 'w': int(w), 'h': int(h),
-                            'label': label, 'score': float(scores[i]),
-                        })
-                        if label == self.state.follow_target:
-                            self.state.targetPose.pose_timestamp = time.monotonic()
-                            self.state.targetPose.x = int(x + (w // 2) - Camera.CAM_WIDTH // 2)
-                            ratio = self.state.targetPose.x / (Camera.CAM_WIDTH / 2)
-                            deviation_deg = ratio * (Camera.HFOV / 2)
-                            self.state.targetPose.angle_rad = math.radians(deviation_deg)
-                self.state.last_detections = detections
+        # SSD outputs: [0]=boxes, [1]=scores, [2]=classes
+        boxes, scores, classes = outputs[0][0], outputs[1][0], outputs[2][0]
 
-        self.picam2.stop()
+        detections = []
+        best = None   # highest-scoring detection of the follow target
+        for i in range(len(scores)):
+            if scores[i] > 0.5:
+                box = boxes[i]
+                x, y, w, h = self.imx500.convert_inference_coords(box, metadata, self.picam2)
+                label = labels[int(classes[i])] if labels else str(int(classes[i]))
+                det = {
+                    'x': int(x), 'y': int(y), 'w': int(w), 'h': int(h),
+                    'label': label, 'score': float(scores[i]),
+                }
+                detections.append(det)
+                if label == self.state.follow_target and (best is None or det['score'] > best['score']):
+                    best = det
+
+        if best is not None:
+            target_x = int(best['x'] + (best['w'] // 2) - Camera.CAM_WIDTH // 2)
+            deviation_deg = target_x / (Camera.CAM_WIDTH / 2) * (Camera.HFOV / 2)
+            # Publish a NEW Pose in one assignment so readers never see the new
+            # timestamp paired with the old x/angle.
+            self.state.targetPose = Pose(target_x, 0, math.radians(deviation_deg),
+                                         pose_timestamp=time.monotonic())
+        self.state.last_detections = detections
 
 
 class Lidar(Sensor):

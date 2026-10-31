@@ -116,6 +116,9 @@ class ManualController(Controller):
 
         left  = self._cur_base + self._cur_diff
         right = self._cur_base - self._cur_diff
+        # fwd+turn together can reach ±160; scale both wheels down so the
+        # curve keeps its shape instead of saturating one wheel.
+        left, right = self._scale_motors(left, right, 100)
 
         # Log only when something changes to avoid 20 Hz spam.
         sig = (fwd, turn, spd, self._cur_base, self._cur_diff, left, right)
@@ -235,6 +238,9 @@ class FollowObjectController(Controller):
 class GoHomeController(Controller):
     """Drive back to (0,0) using straight-line + reactive lidar avoidance.
 
+    Uses Odometry's frame: angle CCW-positive, so a positive heading error
+    means "turn left" (right wheel faster) in every phase.
+
     State machine:
       TURN        — rotate in place to face origin
       DRIVE       — drive toward origin with heading correction; abort if obstacle
@@ -288,7 +294,7 @@ class GoHomeController(Controller):
             self._phase = self.PHASE_DRIVE
             return
         s = self.TURN_SPEED if err > 0 else -self.TURN_SPEED
-        self.motorLeft.setSpeed(-int(-s))   # left forward = right backward (in-place rotation)
+        self.motorLeft.setSpeed(-int(-s))   # s > 0: left backward, right forward → CCW (left)
         self.motorRight.setSpeed(-int(s))
 
     def _step_drive(self, x, y, heading):
@@ -307,8 +313,8 @@ class GoHomeController(Controller):
 
         err = self._normalize_angle(math.atan2(dy, dx) - heading)
         correction = max(-self.DRIVE_SPEED, min(self.DRIVE_SPEED, self.HEADING_KP * err))
-        left  = self.DRIVE_SPEED + correction
-        right = self.DRIVE_SPEED - correction
+        left  = self.DRIVE_SPEED - correction   # err > 0 → right wheel faster → turn left
+        right = self.DRIVE_SPEED + correction
         self.motorLeft.setSpeed(-int(left))
         self.motorRight.setSpeed(-int(right))
 
@@ -316,8 +322,8 @@ class GoHomeController(Controller):
         if time.monotonic() < self._avoid_until:
             # roll forward while veering away from obstacle
             turn = self._avoid_dir * self.TURN_SPEED * 0.7
-            left  = self.DRIVE_SPEED + turn
-            right = self.DRIVE_SPEED - turn
+            left  = self.DRIVE_SPEED - turn     # _avoid_dir +1 → right wheel faster → turn left
+            right = self.DRIVE_SPEED + turn
             self.motorLeft.setSpeed(-int(left))
             self.motorRight.setSpeed(-int(right))
         else:
