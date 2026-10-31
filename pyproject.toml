@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pistorms-robot"
+version = "0.1.0"
+description = "PiStorms board library (pistorms) and the person-follower robot's navigation (navigation)"
+requires-python = ">=3.9"
+# smbus and picamera2 come from the system packages on the Raspberry Pi
+dependencies = ["numpy", "pillow"]
+
+[project.optional-dependencies]
+robot = ["rplidar-roboticia"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# Install once per venv (Pi: ~/Projects/env, Mac: venv_mac), from the folder
+# that contains this file's parent:
+#   pip install -e PiStorms --config-settings editable_mode=compat
+# "compat" adds src/ to sys.path through a .pth file: edits (and SFTP
+# uploads) are picked up immediately, and editors resolve the imports.
