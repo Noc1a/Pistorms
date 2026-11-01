@@ -19,11 +19,11 @@
 #please support mindsensors.com  by purchasing products from mindsensors.com!
 #Learn more product option visit us @  http://www.mindsensors.com/
 
-import ctypes
 import threading
 import time
 
 from . import registers
+from .mindsensors_i2c import mindsensors_i2c
 
 
 ## PiStormsMotor: one motor port of the PiStorms (psm.BAM1, BAM2, BBM1, BBM2).
@@ -40,11 +40,11 @@ from . import registers
 class PiStormsMotor():
     STOP_ATTEMPTS = 3   # outer retries for brake/float (each writeByte retries too)
 
-    def __init__(self, bank, num=0):
-        self.bank = bank
-        self.motornum = num
-        self.index = num - 1         # this motor in its bank: 0 = M1, 1 = M2
-        self._own = (self.index,)    # the motors a single-motor command acts on
+    def __init__(self, bank: mindsensors_i2c, num: int = 0) -> None:
+        self.bank: mindsensors_i2c = bank
+        self.motornum: int = num
+        self.index: int = num - 1    # this motor in its bank: 0 = M1, 1 = M2
+        self._own: tuple[int, ...] = (self.index,)   # the motors a single-motor command acts on
         # Per-motor state is stored on the BANK — not on this object — because
         # BAM1 and BAM2 are separate objects that both drive the bank's M1/M2
         # (sync commands write both). Per-object copies drifted apart and
@@ -86,7 +86,10 @@ class PiStormsMotor():
         a background thread. A newer command on the same motors stops the
         ramp, and its callback is then not called.
         stop_fn (brake, brakeSync): called instead of the last write of
-        speed 0 — writing 0 would float the motor just before braking."""
+        speed 0 — writing 0 would float the motor just before braking.
+        (The board's own ramp, control bit RAMP, is not used: measured with
+        tests/testHWRampUp.py it accelerated like no ramp at all, and once
+        the wheels didn't start.)"""
         speeds = [self._checkSpeed(speed) for speed in speeds]
         if acceleration is not None and acceleration <= 0:
             raise ValueError(f"acceleration must be > 0 percent per second, got {acceleration}")
@@ -124,6 +127,7 @@ class PiStormsMotor():
             # the other motor follows proportionally, so both arrive together
             nb_steps = int(max(abs(change) for change in changes))
             step_duration = 1.0 / acceleration
+            ramp_start = time.monotonic()
 
             # All the steps but the last; the last one is send_final_command()
             for step in range(1, nb_steps):
@@ -134,7 +138,11 @@ class PiStormsMotor():
                     if is_cancelled():
                         return          # a newer command took over: stop, no callback
                     write_fn(*step_speeds)  # one or two arguments depending on the motor count
-                time.sleep(step_duration)
+                # Wait until this step's scheduled time, not a fixed delay:
+                # the I2C writes take 3–4 ms, which would otherwise add up
+                # and make the ramp ~30 % slower than the acceleration asked.
+                next_step_time = ramp_start + step * step_duration
+                time.sleep(max(0.0, next_step_time - time.monotonic()))
 
             if send_final_command() and callback:
                 callback()
@@ -170,8 +178,28 @@ class PiStormsMotor():
             for i in indices:
                 self.bank.motor_speeds[i] = 0
 
-    def pos(self):
-        return ctypes.c_int32(self.bank.readLongSigned(self._reg('Position'))).value
+    def pos(self) -> int:
+        """Encoder position, in degrees.
+        The board doesn't freeze the 4 position bytes while they are read: a
+        read that falls exactly when the counter carries (…FF → …00) returns
+        the old low byte with the new high bytes, 256 off. Measured with the
+        wheels turning: 1 read in ~2000, always +256 with a low byte of 0xFF
+        (going forward; going backward it would be -256 with 0x00). Such a
+        read is the only one with a low byte of 0xFF or 0x00, so only then
+        read again."""
+        first_read = self._readPosition()
+        low_byte = first_read & 0xFF
+        if low_byte not in (0x00, 0xFF):
+            return first_read
+        second_read = self._readPosition()
+        if abs(second_read - first_read) < 128:
+            return second_read
+        # One of the two reads is 256 off: a third read settles it
+        third_read = self._readPosition()
+        return sorted([first_read, second_read, third_read])[1]
+
+    def _readPosition(self) -> int:
+        return self.bank.readLongSigned(self._reg('Position'))
     def resetPos(self):
         if self.index == 0:
             reset_command = registers.r

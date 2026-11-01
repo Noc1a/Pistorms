@@ -22,6 +22,7 @@
 import time
 
 from . import registers
+from .mindsensors_i2c import mindsensors_i2c
 
 
 ## SensorPort: one sensor port of the PiStorms board (psm.BAS1, BAS2, BBS1, BBS2).
@@ -58,19 +59,19 @@ class SensorPort():
     # offset (mode 0x6F → 0xA3, ready 0x70 → 0xA4, data 0x83 → 0xB7, ...).
     SENSOR2_OFFSET = 0x34
 
-    def __init__(self, bank, num=0):
-        self.bank = bank
-        self.sensornum = num
-        self.type = self.PS_SENSOR_TYPE_NONE
+    def __init__(self, bank: mindsensors_i2c, num: int = 0) -> None:
+        self.bank: mindsensors_i2c = bank
+        self.sensornum: int = num
+        self.type: int = self.PS_SENSOR_TYPE_NONE
 
-    def _reg(self, sensor1_register):
+    def _reg(self, sensor1_register: int) -> int:
         """Register of this port, given the sensor-1 register:
             _reg(EV3_DATA) → 0x83 on port 1, 0xB7 on port 2"""
         if self.sensornum == 2:
             return sensor1_register + self.SENSOR2_OFFSET
         return sensor1_register
 
-    def setType(self, type):
+    def setType(self, type: int) -> None:
         """Set the port type (PS_SENSOR_TYPE_...). Does nothing if it is
         already set; otherwise the board needs 1 s, except for I2C."""
         if(type != self.type):
@@ -78,29 +79,29 @@ class SensorPort():
             self.bank.writeByte(self._reg(registers.PS_S1_Mode), type)
             if(self.type != self.PS_SENSOR_TYPE_CUSTOM):
                 time.sleep(1)
-    def getType(self):
+    def getType(self) -> int:
         return self.type
-    def setModeEV3(self, mode):
+    def setModeEV3(self, mode: int) -> None:
         """Mode of the EV3 sensor plugged into this port (see its class)."""
         self.bank.writeByte(self._reg(registers.PS_S1EV_Mode), mode)
 
     # Register access for the devices plugged into this port: each takes the
     # sensor-1 register (ANALOG_DATA, EV3_DATA, ... + offset) and reads the
     # register of this port, e.g. port.readByte(port.EV3_DATA + 1).
-    def readByte(self, sensor1_register):
+    def readByte(self, sensor1_register: int) -> int:
         return self.bank.readByte(self._reg(sensor1_register))
-    def readByteSigned(self, sensor1_register):
+    def readByteSigned(self, sensor1_register: int) -> int:
         return self.bank.readByteSigned(self._reg(sensor1_register))
-    def readInteger(self, sensor1_register):
+    def readInteger(self, sensor1_register: int) -> int:
         return self.bank.readInteger(self._reg(sensor1_register))
-    def readIntegerSigned(self, sensor1_register):
+    def readIntegerSigned(self, sensor1_register: int) -> int:
         return self.bank.readIntegerSigned(self._reg(sensor1_register))
-    def readArray(self, sensor1_register, length):
+    def readArray(self, sensor1_register: int, length: int) -> list[int]:
         return self.bank.readArray(self._reg(sensor1_register), length)
-    def writeByte(self, sensor1_register, value):
+    def writeByte(self, sensor1_register: int, value: int) -> None:
         self.bank.writeByte(self._reg(sensor1_register), value)
 
-    def activateCustomSensorI2C(self):
+    def activateCustomSensorI2C(self) -> None:
         # Put the port in I2C mode, for a mindsensors I2C device.
         # Always write the mode register — the PiStorms board silently resets
         # the port to NONE after ~1s of inactivity, but setType caches the

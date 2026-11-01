@@ -9,22 +9,22 @@ import threading
 from . import registers
 from .mindsensors_i2c import mindsensors_i2c
 
-_banks = {}
+_banks: dict[int, mindsensors_i2c] = {}
 _creation_lock = threading.Lock()
 
 
-def _bank(address):
+def _bank(address: int) -> mindsensors_i2c:
     with _creation_lock:
         if address not in _banks:
             _banks[address] = mindsensors_i2c(address >> 1)
         return _banks[address]
 
 
-def bank_a():
+def bank_a() -> mindsensors_i2c:
     """Bank A: motors BAM1/BAM2, ports BAS1/BAS2, buttons, touchscreen."""
     return _bank(registers.PS_A_ADDRESS)
 
 
-def bank_b():
+def bank_b() -> mindsensors_i2c:
     """Bank B: motors BBM1/BBM2, ports BBS1/BBS2, battery voltage."""
     return _bank(registers.PS_B_ADDRESS)
