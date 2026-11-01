@@ -1,9 +1,9 @@
 import time
 
-from ..mindsensors_i2c import mindsensors_i2c
+from .ms_device import MindsensorsI2CDevice
 
 
-class NXTMMX(mindsensors_i2c):
+class NXTMMX(MindsensorsI2CDevice):
 
     MMX_ADDRESS            = (0x06)
     MMX_VOLTAGE_MULTIPLIER = 37
@@ -56,22 +56,18 @@ class NXTMMX(mindsensors_i2c):
     MMX_PASSCOUNT    = 0x86
     MMX_PASSTOLERANCE = 0x87
 
-    def __init__(self, port, address=MMX_ADDRESS):
-        port.activateCustomSensorI2C()
-        mindsensors_i2c.__init__(self, address >> 1)
+    DEFAULT_ADDRESS = MMX_ADDRESS
 
-    def command(self, cmd): self.writeByte(self.MMX_COMMAND, int(cmd))
     def resPos(self):       self.command(82)
 
     def battVoltage(self):
-        try: return self.readByte(self.MMX_COMMAND) * self.MMX_VOLTAGE_MULTIPLIER
-        except: print("Error: Could not read voltage"); return ""
+        # Reading the command register returns the battery voltage
+        return self.readByte(self.MMX_COMMAND) * self.MMX_VOLTAGE_MULTIPLIER
 
     def pos(self, motor_number):
-        try:
-            if motor_number == 1: return self.readLongSigned(self.MMX_POSITION_M1)
-            if motor_number == 2: return self.readLongSigned(self.MMX_POSITION_M2)
-        except: print("Error: Could not read encoder position"); return ""
+        if motor_number == 1:
+            return self.readLongSigned(self.MMX_POSITION_M1)
+        return self.readLongSigned(self.MMX_POSITION_M2)
 
     def setSpeed(self, motor_number, speed):
         ctrl = self.MMX_CONTROL_SPEED | self.MMX_CONTROL_BRK
@@ -100,16 +96,19 @@ class NXTMMX(mindsensors_i2c):
     def isOverloaded(self, m): return self.statusBit(m, 5) == 1
 
     def waitUntilNotBusy(self, motor_number, timeout=-1):
+        """timeout in steps of 10 ms, -1 = forever. Returns 0 when done, 1 on timeout."""
+        steps_waited = 0
         while self.isBusy(motor_number):
+            if timeout >= 0 and steps_waited >= timeout:
+                return 1
             time.sleep(0.01)
-            timeout -= 1
-            if timeout == 0: return 1
-            if timeout < -5: timeout = -1
+            steps_waited += 1
         return 0
 
-    def _ticks(self, d):
-        return [d % 0x100, (d % 0x10000) // 0x100,
-                (d % 0x1000000) // 0x10000, d // 0x1000000]
+    def _ticks(self, degrees):
+        # Encoder target: 4 bytes, least significant first, negative values in
+        # two's complement (the old manual split gave -1 as last byte for -10°)
+        return list(int(round(degrees)).to_bytes(4, 'little', signed=True))
 
     def _run(self, motor_number, arr):
         if motor_number & 0x01: self.writeArray(self.MMX_SETPT_M1, arr)
@@ -168,25 +167,27 @@ class NXTMMX(mindsensors_i2c):
         while not self._isTachoDone(m): time.sleep(0.05)
 
 
-class NXTServo(mindsensors_i2c):
+class NXTServo(MindsensorsI2CDevice):
 
     NXTSERVO_ADDRESS      = 0xB0
     NXTSERVO_VBATT_SCALER = 37
     NXTSERVO_COMMAND      = 0x41
     NXTSERVO_VBATT        = 0x62
 
-    def __init__(self, port, address=NXTSERVO_ADDRESS):
-        port.activateCustomSensorI2C()
-        mindsensors_i2c.__init__(self, address >> 1)
+    DEFAULT_ADDRESS = NXTSERVO_ADDRESS
+
+    def __init__(self, port, address=None):
+        MindsensorsI2CDevice.__init__(self, port, address)
         self.command('S')
 
     def command(self, cmd):
-        try: self.writeByte(self.NXTSERVO_COMMAND, int(cmd))
-        except ValueError: self.writeByte(self.NXTSERVO_COMMAND, ord(cmd))
+        """cmd is a number or a command letter such as 'S'."""
+        if isinstance(cmd, str):
+            cmd = ord(cmd)
+        self.writeByte(self.NXTSERVO_COMMAND, int(cmd))
 
     def battVoltage(self):
-        try: return self.readByte(self.NXTSERVO_VBATT) * self.NXTSERVO_VBATT_SCALER
-        except: print("Error: Could not read battery voltage"); return ""
+        return self.readByte(self.NXTSERVO_VBATT) * self.NXTSERVO_VBATT_SCALER
 
     def setSpeed(self, servoNumber, speed):    self.writeByte(0x52 + servoNumber - 1, speed % 256)
     def setPosition(self, servoNumber, position): self.writeByte(0x5A + servoNumber - 1, position % 256)
@@ -209,7 +210,7 @@ class NXTServo(mindsensors_i2c):
     def gotoEEPROM(self, position): self.command('G'); self.command(position)
 
 
-class PFMate(mindsensors_i2c):
+class PFMate(MindsensorsI2CDevice):
 
     PFMATE_ADDRESS  = (0x48)
     PFMATE_FLOAT    = 0
@@ -224,12 +225,12 @@ class PFMate(mindsensors_i2c):
     PFMATE_OPER_B   = 0x46
     PFMATE_SPEED_B  = 0x47
 
-    def __init__(self, port, address=PFMATE_ADDRESS):
-        port.activateCustomSensorI2C()
-        mindsensors_i2c.__init__(self, address >> 1)
+    DEFAULT_ADDRESS = PFMATE_ADDRESS
 
-    def command(self, cmd): self.writeByte(self.PFMATE_COMMAND, int(cmd))
-    def _go(self): time.sleep(0.1); self.command(71); time.sleep(0.1)
+    def _go(self):
+        time.sleep(0.1)
+        self.command(71)   # 'G': send the settings to the IR receiver
+        time.sleep(0.1)
 
     def controlBothMotors(self, channel, operationA, speedA, operationB, speedB):
         self.writeArray(self.PFMATE_CHANNEL, [channel, 0x00, operationA, speedA, operationB, speedB])
@@ -243,16 +244,14 @@ class PFMate(mindsensors_i2c):
         self.writeArray(self.PFMATE_OPER_B, [operationB, speedB]); self._go()
 
 
-class EV3Lights(mindsensors_i2c):
+class EV3Lights(MindsensorsI2CDevice):
 
     EV3Lights_ADDRESS = (0x2c)
     RED   = 0x42
     GREEN = 0x43
     BLUE  = 0x44
 
-    def __init__(self, port, address=EV3Lights_ADDRESS):
-        port.activateCustomSensorI2C()
-        mindsensors_i2c.__init__(self, address >> 1)
+    DEFAULT_ADDRESS = EV3Lights_ADDRESS
 
     def setColor(self, Color, intensity):
         self.writeArray(Color, [intensity])

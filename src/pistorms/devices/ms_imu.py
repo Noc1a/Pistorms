@@ -2,10 +2,13 @@ import math
 import struct
 import time
 
-from ..mindsensors_i2c import mindsensors_i2c
+from .ms_device import MindsensorsI2CDevice
 
 
-class AbsoluteIMU(mindsensors_i2c):
+class AbsoluteIMU(MindsensorsI2CDevice):
+    """mindsensors AbsoluteIMU. Unlike the other devices, the getters return
+    None (or a tuple of None) on a bus error: the robot's sensor threads
+    rely on it."""
 
     ABSIMU_ADDRESS = (0x22)
     COMMAND  = 0x41
@@ -24,25 +27,23 @@ class AbsoluteIMU(mindsensors_i2c):
     GYRO_Z   = 0x57
     GYRO_FILTER = 0x5A
 
+    DEFAULT_ADDRESS = ABSIMU_ADDRESS
+
     gyro_unit = 8.75
-
-    def __init__(self, port, address=ABSIMU_ADDRESS):
-        self._port = port
-        port.activateCustomSensorI2C()
-        mindsensors_i2c.__init__(self, address >> 1)
-
-    def command(self, command):
-        self.writeByte(self.COMMAND, int(command))
 
     def get_acc_mag_gyr(self):
         """Single 20-byte block read from ACCEL_X — returns (acc m/s², mag nT, gyr deg/s).
-        Re-activates the sensor port before reading: PiStorms silently reverts the port to
-        NONE after ~1s idle, and the IMU needs a few ms to respond after re-arming, so we
-        retry once with a settle delay. Returns (None,None,None) if all attempts fail."""
+        Re-activates the sensor port before EVERY read (validated on the robot, kept as
+        is): PiStorms silently reverts the port to NONE after ~1s idle, and the IMU needs
+        a few ms to respond after re-arming, so we retry with a settle delay.
+        Returns (None,None,None) if all attempts fail."""
         for attempt in range(3):
-            self._port.activateCustomSensorI2C()
+            self.port.activateCustomSensorI2C()
             if attempt > 0:
                 time.sleep(0.05)
+            # The port was just re-activated: tell _keepPortActive, so that
+            # another getter called soon after doesn't wait for a re-activation
+            self._last_access = time.monotonic()
             try:
                 raw = self.bus.read_i2c_block_data(self.address, self.ACCEL_X, 20)
                 break
@@ -59,6 +60,7 @@ class AbsoluteIMU(mindsensors_i2c):
     def get_all_values(self):
         """Single 23-byte block read from TILT_X. Returns (tilt, compass, gyr deg/s, acc m/s², mag nT), or (None,...) on error."""
         try:
+            self._keepPortActive()
             raw = self.bus.read_i2c_block_data(self.address, self.TILT_X, 23)
         except Exception:
             return None, None, None, None, None
@@ -89,6 +91,7 @@ class AbsoluteIMU(mindsensors_i2c):
     def get_tiltall(self):
         """Returns (x, y, z) tilt in degrees via single block read, or None on error."""
         try:
+            self._keepPortActive()
             raw = self.bus.read_i2c_block_data(self.address, self.TILT_X, 3)
             vals = struct.unpack("<3b", bytes(raw))
             return tuple(math.degrees(math.asin(max(-1.0, min(1.0, v / 128.0)))) for v in vals)
@@ -110,6 +113,7 @@ class AbsoluteIMU(mindsensors_i2c):
     def get_accelall(self):
         """Returns (x, y, z) accelerometer in m/s² via single block read, or None on error."""
         try:
+            self._keepPortActive()
             raw = self.bus.read_i2c_block_data(self.address, self.ACCEL_X, 6)
             return tuple(self._convert_acc(struct.unpack("<3h", bytes(raw))))
         except Exception:
@@ -140,6 +144,7 @@ class AbsoluteIMU(mindsensors_i2c):
     def get_magall(self):
         """Returns (x, y, z) magnetometer in nT via single block read, or None on error."""
         try:
+            self._keepPortActive()
             raw = self.bus.read_i2c_block_data(self.address, self.MAG_X, 6)
             return tuple(self._convert_mag(struct.unpack("<3h", bytes(raw))))
         except Exception:
@@ -160,6 +165,7 @@ class AbsoluteIMU(mindsensors_i2c):
     def get_gyroall(self):
         """Returns (x, y, z) gyroscope in deg/s via single block read, or None on error."""
         try:
+            self._keepPortActive()
             raw = self.bus.read_i2c_block_data(self.address, self.GYRO_X, 6)
             return tuple(self._convert_gyro(struct.unpack("<3h", bytes(raw))))
         except Exception:

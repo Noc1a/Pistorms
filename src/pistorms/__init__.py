@@ -4,5 +4,6 @@
     from pistorms.devices import AbsoluteIMU
     from pistorms.ui import mindsensorsUI, TouchScreenInput
 """
-from .PiStorms import PiStorms, PiStormsMotor, PiStormsSensor, RampedMotor
-from .PiStormsCom import PiStormsCom
+from .PiStorms import PiStorms
+from .motor import PiStormsMotor
+from .sensor_port import SensorPort

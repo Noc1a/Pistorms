@@ -1,9 +1,34 @@
-import time
+from ..sensor_port import SensorPort
+from .lego_sensors import remote_left_direction, remote_right_direction
+from .ms_device import MindsensorsI2CDevice
 
-from ..mindsensors_i2c import mindsensors_i2c
+# All the I2C sensors below raise OSError when the bus fails, like the rest
+# of the library (they used to print a message and return "").
 
 
-class LineLeader(mindsensors_i2c):
+class _LineSensorArray(MindsensorsI2CDevice):
+    """Common part of LineLeader and LightSensorArray: 8 light sensors in a
+    row, calibrated on a white and a black surface."""
+
+    CALIBRATED = None     # register of the 8 calibrated readings (1 byte each)
+    UNCALIBRATED = None   # register of the 8 raw readings (2 bytes each)
+
+    def White_Cal(self):   self.command(87)   # 'W'
+    def Black_Cal(self):   self.command(66)   # 'B'
+    def Wakeup(self):      self.command(80)   # 'P'
+    def Sleep(self):       self.command(68)   # 'D'
+
+    def ReadRaw_Calibrated(self):
+        return self.readArray(self.CALIBRATED, 8)
+
+    def ReadRaw_Uncalibrated(self):
+        readings = []
+        for sensor in range(8):
+            readings.append(self.readInteger(self.UNCALIBRATED + sensor * 2))
+        return readings
+
+
+class LineLeader(_LineSensorArray):
 
     LL_ADDRESS    = 0x02
     LL_COMMAND    = 0x41
@@ -20,177 +45,86 @@ class LineLeader(mindsensors_i2c):
     LL_CALIBRATED = 0x49
     LL_UNCALIBRATED = 0x74
 
-    def __init__(self, port, address=LL_ADDRESS):
-        port.activateCustomSensorI2C()
-        mindsensors_i2c.__init__(self, address >> 1)
+    # Same default address as DISTNx (0x02): two of them on the same PiStorms
+    # bank need different addresses.
+    DEFAULT_ADDRESS = LL_ADDRESS
+    CALIBRATED = LL_CALIBRATED
+    UNCALIBRATED = LL_UNCALIBRATED
 
-    def command(self, command):
-        self.writeByte(self.LL_COMMAND, int(command))
+    def steering(self):     return self.readByteSigned(self.LL_STEERING)
+    def average(self):      return self.readByte(self.LL_AVERAGE)
+    def result(self):       return self.readByte(self.LL_RESULT)
 
-    def White_Cal(self):   self.command(87)
-    def Black_Cal(self):   self.command(66)
-    def Wakeup(self):      self.command(80)
-    def Sleep(self):       self.command(68)
+    def getSetPoint(self):  return self.readByte(self.LL_SETPOINT)
+    def getKP(self):        return self.readByte(self.LL_Kp)
+    def getKI(self):        return self.readByte(self.LL_KI)
+    def getKD(self):        return self.readByte(self.LL_KD)
+    def getKPfactor(self):  return self.readByte(self.LL_KPfactor)
+    def getKIfactor(self):  return self.readByte(self.LL_KIfactor)
+    def getKDfactor(self):  return self.readByte(self.LL_KDfactor)
 
-    def ReadRaw_Calibrated(self):
-        try:
-            return self.readArray(self.LL_CALIBRATED, 8)
-        except:
-            print("Error: Could not read Lineleader")
-            return ""
-
-    def ReadRaw_Uncalibrated(self):
-        try:
-            s1 = self.readInteger(self.LL_UNCALIBRATED)
-            s2 = self.readInteger(self.LL_UNCALIBRATED + 2)
-            s3 = self.readInteger(self.LL_UNCALIBRATED + 4)
-            s4 = self.readInteger(self.LL_UNCALIBRATED + 6)
-            s5 = self.readInteger(self.LL_UNCALIBRATED + 8)
-            s6 = self.readInteger(self.LL_UNCALIBRATED + 10)
-            s7 = self.readInteger(self.LL_UNCALIBRATED + 12)
-            s8 = self.readInteger(self.LL_UNCALIBRATED + 14)
-            return [s1, s2, s3, s4, s5, s6, s7, s8]
-        except:
-            print("Error: Could not read Lineleader")
-            return ""
-
-    def steering(self):
-        try: return self.readByteSigned(self.LL_STEERING)
-        except: print("Error: Could not read Lineleader"); return ""
-
-    def average(self):
-        try: return self.readByte(self.LL_AVERAGE)
-        except: print("Error: Could not read Lineleader"); return ""
-
-    def result(self):
-        try: return self.readByte(self.LL_RESULT)
-        except: print("Error: Could not read Lineleader"); return ""
-
-    def getSetPoint(self):
-        try: return self.readByte(self.LL_SETPOINT)
-        except: print("Error: Could not read Lineleader"); return ""
-
-    def setSetPoint(self):
-        try: return self.writeByte(self.LL_SETPOINT)
-        except: print("Error: Could not write to Lineleader"); return ""
-
-    def setKP(self):
-        try: return self.writeByte(self.LL_KP)
-        except: print("Error: Could not write to Lineleader"); return ""
-
-    def setKI(self):
-        try: return self.writeByte(self.LL_KI)
-        except: print("Error: Could not write to Lineleader"); return ""
-
-    def setKD(self):
-        try: return self.writeByte(self.LL_KD)
-        except: print("Error: Could not write to Lineleader"); return ""
-
-    def setKPfactor(self):
-        try: return self.writeByte(self.LL_KPfactor)
-        except: print("Error: Could not write to Lineleader"); return ""
-
-    def setKIfactor(self):
-        try: return self.writeByte(self.LL_KIfactor)
-        except: print("Error: Could not write to Lineleader"); return ""
-
-    def setKDfactor(self):
-        try: return self.writeByte(self.LL_KDfactor)
-        except: print("Error: Could not write to Lineleader"); return ""
-
-    def getKP(self):
-        try: return self.readByte(self.LL_KP)
-        except: print("Error: Could not write to Lineleader"); return ""
-
-    def getKI(self):
-        try: return self.readByte(self.LL_KI)
-        except: print("Error: Could not write to Lineleader"); return ""
-
-    def getKD(self):
-        try: return self.readByte(self.LL_KD)
-        except: print("Error: Could not write to Lineleader"); return ""
-
-    def getKPfactor(self):
-        try: return self.readByte(self.LL_KPfactor)
-        except: print("Error: Could not write to Lineleader"); return ""
-
-    def getKIfactor(self):
-        try: return self.readByte(self.LL_KIfactor)
-        except: print("Error: Could not write to Lineleader"); return ""
-
-    def getKDfactor(self):
-        try: return self.readByte(self.LL_KDfactor)
-        except: print("Error: Could not write to Lineleader"); return ""
+    def setSetPoint(self, value):  self.writeByte(self.LL_SETPOINT, value)
+    def setKP(self, value):        self.writeByte(self.LL_Kp, value)
+    def setKI(self, value):        self.writeByte(self.LL_KI, value)
+    def setKD(self, value):        self.writeByte(self.LL_KD, value)
+    def setKPfactor(self, value):  self.writeByte(self.LL_KPfactor, value)
+    def setKIfactor(self, value):  self.writeByte(self.LL_KIfactor, value)
+    def setKDfactor(self, value):  self.writeByte(self.LL_KDfactor, value)
 
 
-class LightSensorArray(mindsensors_i2c):
+class LightSensorArray(_LineSensorArray):
 
-    LSA_ADDRESS     = 0x14
-    LSA_COMMAND     = 0x41
-    LSA_CALIBRATED  = 0x42
+    LSA_ADDRESS      = 0x14
+    LSA_COMMAND      = 0x41
+    LSA_CALIBRATED   = 0x42
     LSA_UNCALIBRATED = 0x6A
 
-    def __init__(self, port, address=LSA_ADDRESS):
-        port.activateCustomSensorI2C()
-        mindsensors_i2c.__init__(self, address >> 1)
-
-    def command(self, cmd):   self.writeByte(self.LSA_COMMAND, int(cmd))
-    def White_Cal(self):      self.command(87)
-    def Black_Cal(self):      self.command(66)
-    def Wakeup(self):         self.command(80)
-    def Sleep(self):          self.command(68)
-
-    def ReadRaw_Calibrated(self):
-        try: return self.readArray(self.LSA_CALIBRATED, 8)
-        except: print("Error: Could not read LSArray"); return ""
-
-    def ReadRaw_Uncalibrated(self):
-        try:
-            return [self.readInteger(self.LSA_UNCALIBRATED + i * 2) for i in range(8)]
-        except:
-            print("Error: Could not read LSArray")
-            return ""
+    DEFAULT_ADDRESS = LSA_ADDRESS
+    CALIBRATED = LSA_CALIBRATED
+    UNCALIBRATED = LSA_UNCALIBRATED
 
 
-class SumoEyes(mindsensors_i2c):
-
-    SE_None   = [0, "None"]
-    SE_Values = {465: [1, "Front"], 555: [3, "Right"], 800: [2, "Left"]}
-
-    PS_S1EV_Ready = 0x70
-    PS_S2EV_Ready = 0xA4
+class SumoEyes:
+    """mindsensors SumoEyes: obstacle zone in front of the robot. Not an I2C
+    device: it is an analog sensor read through the PiStorms port, and the
+    zone is coded in the value."""
 
     LONG_RANGE  = True
     SHORT_RANGE = False
 
-    def __init__(self, port):
-        self.sensor = port.pssensor
-        mindsensors_i2c.__init__(self, self.sensor.bank.address)
-        self.setRange()
-        self.sensor.setModeEV3(0)
+    ZONE_NONE, ZONE_FRONT, ZONE_LEFT, ZONE_RIGHT = 0, 1, 2, 3
+    ZONE_NAMES = {0: "None", 1: "Front", 2: "Left", 3: "Right"}
+    # Analog value of each zone, ± TOLERANCE
+    ZONE_VALUES = {ZONE_FRONT: 465, ZONE_LEFT: 800, ZONE_RIGHT: 555}
+    TOLERANCE = 30
 
-    def detectObstactleZone(self, verbose=False):
-        reading = self.readSensorValue()
-        for reference in self.SE_Values.keys():
-            if self.isNear(reference, reading):
-                output = self.SE_Values[reference]
-                return output[1] if verbose else output[0]
-        return self.SE_None[1] if verbose else self.SE_None[0]
-
-    def readSensorValue(self):
-        return self.readInteger(self.PS_S1EV_Ready if self.sensor.sensornum == 1 else self.PS_S2EV_Ready)
+    def __init__(self, port: SensorPort):
+        self.port = port     # e.g. psm.BAS1
+        self.setRange(self.LONG_RANGE)
 
     def setRange(self, range=LONG_RANGE):
+        # Long range = light off (ambient type), short range = light on
         if range == self.LONG_RANGE:
-            self.sensor.setType(self.sensor.PS_SENSOR_TYPE_LIGHT_INACTIVE)
-        elif range == self.SHORT_RANGE:
-            self.sensor.setType(self.sensor.PS_SENSOR_TYPE_LIGHT_ACTIVE)
+            self.port.setType(SensorPort.PS_SENSOR_TYPE_LIGHT_INACTIVE)
+        else:
+            self.port.setType(SensorPort.PS_SENSOR_TYPE_LIGHT_ACTIVE)
 
-    def isNear(self, reference, value, tolerance=40):
-        return (value > (reference - tolerance)) and (value < (reference + tolerance))
+    def readSensorValue(self):
+        return self.port.readInteger(self.port.ANALOG_DATA)
+
+    def detectObstactleZone(self, verbose=False):
+        """ZONE_NONE, ZONE_FRONT, ZONE_LEFT or ZONE_RIGHT — or its name if verbose."""
+        value = self.readSensorValue()
+        zone = self.ZONE_NONE
+        for candidate_zone, zone_value in self.ZONE_VALUES.items():
+            if abs(value - zone_value) < self.TOLERANCE:
+                zone = candidate_zone
+        if verbose:
+            return self.ZONE_NAMES[zone]
+        return zone
 
 
-class IRThermometer(mindsensors_i2c):
+class IRThermometer(MindsensorsI2CDevice):
 
     IRT_ADDRESS         = 0x2A
     IRT_COMMAND         = 0x41
@@ -199,188 +133,103 @@ class IRThermometer(mindsensors_i2c):
     IRT_AMBIENT_FAHR    = 0x46
     IRT_TARGET_FAHR     = 0x48
 
-    def __init__(self, port, address=IRT_ADDRESS):
-        port.activateCustomSensorI2C()
-        mindsensors_i2c.__init__(self, address >> 1)
+    DEFAULT_ADDRESS = IRT_ADDRESS
 
-    def readAmbientCelsius(self): return float(self.readInteger(self.IRT_AMBIENT_CELSIUS)) / 100
-    def readTargetCelsius(self):  return float(self.readInteger(self.IRT_TARGET_CELSIUS)) / 100
-    def readAmbientFahr(self):    return float(self.readInteger(self.IRT_AMBIENT_FAHR)) / 100
-    def readTargetFahr(self):     return float(self.readInteger(self.IRT_TARGET_FAHR)) / 100
+    # Temperatures are stored in hundredths of a degree
+    def readAmbientCelsius(self): return self.readInteger(self.IRT_AMBIENT_CELSIUS) / 100
+    def readTargetCelsius(self):  return self.readInteger(self.IRT_TARGET_CELSIUS) / 100
+    def readAmbientFahr(self):    return self.readInteger(self.IRT_AMBIENT_FAHR) / 100
+    def readTargetFahr(self):     return self.readInteger(self.IRT_TARGET_FAHR) / 100
 
 
-class DISTNx(mindsensors_i2c):
+class DISTNx(MindsensorsI2CDevice):
 
-    DIST_ADDRESS = (0x02)
-    COMMAND  = 0x41
+    DIST_ADDRESS = 0x02
     DISTANCE = 0x42
     VOLTAGE  = 0x44
 
-    def __init__(self, port, address=DIST_ADDRESS):
-        port.activateCustomSensorI2C()
-        mindsensors_i2c.__init__(self, address >> 1)
-
-    def command(self, command): self.writeByte(self.COMMAND, int(command))
+    # Same default address as LineLeader (0x02)
+    DEFAULT_ADDRESS = DIST_ADDRESS
 
     def get_distance(self):
-        try: return self.readInteger(self.DISTANCE)
-        except: print("Error: Could not read distance"); return ""
+        """Distance in millimeters."""
+        return self.readInteger(self.DISTANCE)
 
     def get_distance_inches(self):
-        try: return self.get_distance() / 25
-        except: print("Error: Could not read distance"); return ""
+        return self.get_distance() / 25.4
 
     def get_voltage(self):
-        try: return self.readInteger(self.VOLTAGE)
-        except: print("Error: Could not read voltage"); return ""
+        return self.readInteger(self.VOLTAGE)
 
 
-class AngleSensor(mindsensors_i2c):
+class AngleSensor(MindsensorsI2CDevice):
 
-    ANGLE_ADDRESS = (0x30)
-    COMMAND = 0x41
+    ANGLE_ADDRESS = 0x30
     ANGLE   = 0x42
     RAW     = 0x46
     RPM     = 0x4A
 
-    def __init__(self, port, address=ANGLE_ADDRESS):
-        port.activateCustomSensorI2C()
-        mindsensors_i2c.__init__(self, address >> 1)
+    DEFAULT_ADDRESS = ANGLE_ADDRESS
 
-    def command(self, command): self.writeByte(self.COMMAND, int(command))
-
-    def get_angle(self):
-        try: return self.readLongSigned(self.ANGLE)
-        except: print("Error: Could not read angle"); return ""
-
-    def get_raw(self):
-        try: return self.readLongSigned(self.RAW)
-        except: print("Error: Could not read raw angle"); return ""
-
-    def get_rpm(self):
-        try: return self.readIntegerSigned(self.RPM)
-        except: print("Error: Could not read rpm"); return ""
+    def get_angle(self): return self.readLongSigned(self.ANGLE)
+    def get_raw(self):   return self.readLongSigned(self.RAW)
+    def get_rpm(self):   return self.readIntegerSigned(self.RPM)
 
 
-class CurrentMeter(mindsensors_i2c):
+class _ReferenceMeter(MindsensorsI2CDevice):
+    """Common part of CurrentMeter and VoltMeter: a calibrated reading, a
+    reading relative to a stored reference, and the reference itself."""
 
-    CURRENT_ADDRESS = (0x28)
-    COMMAND = 0x41
-    CAL     = 0x43
-    REL     = 0x45
-    REF     = 0x47
+    CAL = 0x43
+    REL = 0x45
+    REF = 0x47
 
-    def __init__(self, port, address=CURRENT_ADDRESS):
-        port.activateCustomSensorI2C()
-        mindsensors_i2c.__init__(self, address >> 1)
-
-    def command(self, cmd): self.writeByte(self.COMMAND, int(cmd))
-
-    def get_calibrated(self):
-        try: return self.readIntegerSigned(self.CAL)
-        except: print("Error: Could not read calibrated current"); return ""
-
-    def get_relative(self):
-        try: return self.readIntegerSigned(self.REL)
-        except: print("Error: Could not read relative current"); return ""
-
-    def get_reference(self):
-        try: return self.readIntegerSigned(self.REF)
-        except: print("Error: Could not read reference current"); return ""
+    def get_calibrated(self): return self.readIntegerSigned(self.CAL)
+    def get_relative(self):   return self.readIntegerSigned(self.REL)
+    def get_reference(self):  return self.readIntegerSigned(self.REF)
 
     def set_reference(self):
-        try: self.command(68)
-        except: print("Error: Could not set reference current"); return ""
+        """Store the present reading as the reference."""
+        self.command(68)   # 'D'
 
 
-class VoltMeter(mindsensors_i2c):
-
-    VOLT_ADDRESS = (0x26)
-    COMMAND = 0x41
-    CAL     = 0x43
-    REL     = 0x45
-    REF     = 0x47
-
-    def __init__(self, port, address=VOLT_ADDRESS):
-        port.activateCustomSensorI2C()
-        mindsensors_i2c.__init__(self, address >> 1)
-
-    def command(self, cmd): self.writeByte(self.COMMAND, int(cmd))
-
-    def get_calibrated(self):
-        try: return self.readIntegerSigned(self.CAL)
-        except: print("Error: Could not read calibrated voltage"); return ""
-
-    def get_relative(self):
-        try: return self.readIntegerSigned(self.REL)
-        except: print("Error: Could not read relative voltage"); return ""
-
-    def get_reference(self):
-        try: return self.readIntegerSigned(self.REF)
-        except: print("Error: Could not read reference voltage"); return ""
-
-    def set_reference(self):
-        try: self.command(68)
-        except: print("Error: Could not set reference voltage"); return ""
+class CurrentMeter(_ReferenceMeter):
+    CURRENT_ADDRESS = 0x28
+    DEFAULT_ADDRESS = CURRENT_ADDRESS
 
 
-class PressureSensor(mindsensors_i2c):
+class VoltMeter(_ReferenceMeter):
+    VOLT_ADDRESS = 0x26
+    DEFAULT_ADDRESS = VOLT_ADDRESS
 
-    PPS58_ADDRESS = (0x18)
-    COMMAND = 0x41
+
+class PressureSensor(MindsensorsI2CDevice):
+
+    PPS58_ADDRESS = 0x18
     UNIT    = 0x42
     ABS     = 0x43
     GAUGE   = 0x45
     REF     = 0x47
     RAW     = 0x53
 
-    def __init__(self, port, address=PPS58_ADDRESS):
-        port.activateCustomSensorI2C()
-        mindsensors_i2c.__init__(self, address >> 1)
+    DEFAULT_ADDRESS = PPS58_ADDRESS
 
-    def command(self, cmd): self.writeByte(self.COMMAND, int(cmd))
+    def get_unit(self):      return self.readByte(self.UNIT)
+    def get_absolute(self):  return self.readIntegerSigned(self.ABS)
+    def get_gauge(self):     return self.readIntegerSigned(self.GAUGE)
+    def get_reference(self): return self.readIntegerSigned(self.REF)
+    def get_raw(self):       return self.readLongSigned(self.RAW)
 
-    def get_unit(self):
-        try: return self.readByte(self.UNIT)
-        except: print("Error: Could not read unit value"); return ""
-
-    def get_absolute(self):
-        try: return self.readIntegerSigned(self.ABS)
-        except: print("Error: Could not read absolute pressure"); return ""
-
-    def get_gauge(self):
-        try: return self.readIntegerSigned(self.GAUGE)
-        except: print("Error: Could not read gauge pressure"); return ""
-
-    def get_reference(self):
-        try: return self.readIntegerSigned(self.REF)
-        except: print("Error: Could not read reference pressure"); return ""
-
-    def get_raw(self):
-        try: return self.readLongSigned(self.RAW)
-        except: print("Error: Could not read raw pressure"); return ""
-
-    def set_reference(self):
-        try: self.command(68)
-        except: print("Error: Could not set reference pressure"); return ""
-
-    def set_unit_PSI(self):
-        try: self.command(80)
-        except: print("Error: Could not set PSI as unit"); return ""
-
-    def set_unit_mbar(self):
-        try: self.command(98)
-        except: print("Error: Could not set millibar as unit"); return ""
-
-    def set_unit_kpascal(self):
-        try: self.command(107)
-        except: print("Error: Could not set kilopascal as unit"); return ""
+    def set_reference(self):    self.command(68)    # 'D'
+    def set_unit_PSI(self):     self.command(80)    # 'P'
+    def set_unit_mbar(self):    self.command(98)    # 'b'
+    def set_unit_kpascal(self): self.command(107)   # 'k'
 
 
-class EV3SensAdapt(mindsensors_i2c):
+class EV3SensAdapt(MindsensorsI2CDevice):
     """EV3 Sensor Adapter / Sensor Mux. Pass channel address (0xA0/0xA2/0xA4) for mux channels."""
 
-    EV3SensAdapt_ADDRESS = (0x32)
+    EV3SensAdapt_ADDRESS = 0x32
     SETMODE = 0x52
     DATA1   = 0x54
     DATA2   = 0x55
@@ -391,83 +240,81 @@ class EV3SensAdapt(mindsensors_i2c):
     DATA7   = 0x5A
     DATA8   = 0x5B
 
-    def __init__(self, port, address=EV3SensAdapt_ADDRESS):
-        port.activateCustomSensorI2C()
-        mindsensors_i2c.__init__(self, address >> 1)
+    DEFAULT_ADDRESS = EV3SensAdapt_ADDRESS
+    TOUCH_MODE = 15
 
     def setMode(self, mode): self.writeByte(self.SETMODE, mode)
     def getMode(self):       return self.readByte(self.SETMODE)
 
+    # Touch sensor
     def isTouchedEV3(self):
-        try: self.setMode(15); return self.readByte(self.DATA1) == 1
-        except: print("Error: Could not read EV3 Touch Sensor"); return ""
+        self.setMode(self.TOUCH_MODE)
+        return self.readByte(self.DATA1) == 1
 
     def numTouchesEV3(self):
-        try: self.setMode(15); return self.readByte(self.DATA2)
-        except: print("Error: Could not read EV3 Touch Sensor"); return ""
+        self.setMode(self.TOUCH_MODE)
+        return self.readByte(self.DATA2)
 
     def resetTouchesEV3(self):
-        try: self.setMode(15); return self.writeByte(self.DATA2, 0)
-        except: print("Error: Could not reset EV3 Touch Sensor"); return ""
+        self.setMode(self.TOUCH_MODE)
+        self.writeByte(self.DATA2, 0)
 
+    # Infrared sensor
     def distanceIREV3(self):
-        try: self.setMode(0); return self.readByte(self.DATA1)
-        except: print("Error: Could not read EV3 IR Sensor"); return ""
+        self.setMode(0)
+        return self.readByte(self.DATA1)
 
     def headingIREV3(self, channel):
-        try: self.setMode(1); return self.readByteSigned(self.DATA1 + (channel - 1) * 2)
-        except: print("Error: Could not read EV3 IR Sensor"); return ""
+        self.setMode(1)
+        channel_offset = (channel - 1) * 2       # 2 bytes per channel: heading, distance
+        return self.readByteSigned(self.DATA1 + channel_offset)
 
     def distanceRemoteIREV3(self, channel):
-        try: self.setMode(1); return self.readByte(self.DATA1 + (channel - 1) * 2 + 1)
-        except: print("Error: Could not read EV3 IR Sensor"); return ""
+        self.setMode(1)
+        channel_offset = (channel - 1) * 2
+        return self.readByte(self.DATA1 + channel_offset + 1)
+
+    def _readRemote(self, channel):
+        self.setMode(2)
+        return self.readByte(self.DATA1 + channel - 1)
 
     def remoteLeft(self, channel):
-        try:
-            self.setMode(2)
-            r = self.readByte(self.DATA1 + channel - 1)
-            if r in (0, 3, 4): return  0
-            if r in (1, 5, 6): return  1
-            if r in (2, 7, 8): return -1
-        except: print("Error: Could not read EV3 IR Sensor"); return ""
+        return remote_left_direction(self._readRemote(channel))
 
     def remoteRight(self, channel):
-        try:
-            self.setMode(2)
-            r = self.readByte(self.DATA1 + channel - 1)
-            if r in (0, 1, 2): return  0
-            if r in (3, 7, 5): return  1
-            if r in (4, 6, 8): return -1
-        except: print("Error: Could not read EV3 IR Sensor"); return ""
+        return remote_right_direction(self._readRemote(channel))
 
+    # Ultrasonic sensor
     def distanceUSEV3(self):
-        try: self.setMode(0); return self.readInteger(self.DATA1)
-        except: print("Error: Could not read EV3 Ultrasonic"); return ""
+        self.setMode(0)
+        return self.readInteger(self.DATA1)
 
     def distanceUSEV3in(self):
-        try: self.setMode(1); return self.readInteger(self.DATA1)
-        except: print("Error: Could not read EV3 Ultrasonic"); return ""
+        self.setMode(1)
+        return self.readInteger(self.DATA1)
 
     def presenceUSEV3(self):
-        try: self.setMode(2); return self.readByte(self.DATA1) == 1
-        except: print("Error: Could not read EV3 Ultrasonic"); return ""
+        self.setMode(2)
+        return self.readByte(self.DATA1) == 1
 
+    # Gyro sensor
     def gyroAngleEV3(self):
-        try: self.setMode(0); return self.readIntegerSigned(self.DATA1)
-        except: print("Error: Could not read EV3 Gyro"); return ""
+        self.setMode(0)
+        return self.readIntegerSigned(self.DATA1)
 
     def gyroRateEV3(self):
-        try: self.setMode(1); return self.readIntegerSigned(self.DATA1)
-        except: print("Error: Could not read EV3 Gyro"); return ""
+        self.setMode(1)
+        return self.readIntegerSigned(self.DATA1)
 
+    # Color sensor
     def reflectedLightSensorEV3(self):
-        try: self.setMode(0); return self.readInteger(self.DATA1)
-        except: print("Error: Could not read EV3 Color Sensor"); return ""
+        self.setMode(0)
+        return self.readInteger(self.DATA1)
 
     def ambientLightSensorEV3(self):
-        try: self.setMode(1); return self.readInteger(self.DATA1)
-        except: print("Error: Could not read EV3 Color Sensor"); return ""
+        self.setMode(1)
+        return self.readInteger(self.DATA1)
 
     def colorSensorEV3(self):
-        try: self.setMode(2); return self.readInteger(self.DATA1)
-        except: print("Error: Could not read EV3 Color Sensor"); return ""
+        self.setMode(2)
+        return self.readInteger(self.DATA1)

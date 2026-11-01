@@ -2,10 +2,11 @@
 # Revised mindsensorsUI for Framebuffer (FB1)
 # Provides full compatibility with PiStorms original API
 
+import statistics
 import sys
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
-from ..PiStormsCom import PiStormsCom
+from .. import banks, registers
 
 class mindsensorsUI():
     ## Color Constants
@@ -27,18 +28,17 @@ class mindsensorsUI():
     PS_MODE_POPUP = 1
     PS_MODE_DEAD = 2
 
-    def __init__(self, name="PiStorms", rotation=3, comm=None, clear=True):
+    def __init__(self, name="PiStorms", rotation=3, clear=True):
         """
         Initializes the UI device using the Framebuffer /dev/fb1.
+        Works on its own (without PiStorms): the touchscreen is read through
+        bank A of the board, shared with the rest of the process.
         @param name: Display title (for compatibility).
         @param rotation: Screen rotation (0-3).
-        @param comm: PiStormsCom to read the touchscreen through. PiStorms
-                     passes its own; a standalone UI opens one WITHOUT the
-                     motor reset (the UI only needs the touchscreen).
         @param clear: Clear the LCD on init.
         """
         self.fb_path = "/dev/fb1"
-        self.comm = comm if comm is not None else PiStormsCom(reset=False)
+        self.bank = banks.bank_a()
         self.currentRotation = rotation
         self.currentMode = self.PS_MODE_TERMINAL
         
@@ -223,9 +223,42 @@ class mindsensorsUI():
 
     # --- Touch & Coordinates ---
 
+    def getTouchscreenCoordinates(self):
+        """Raw touchscreen coordinates (tx, ty), or (0, 0) when not touched,
+        the finger is sliding, or the board can't be read."""
+        sample_size = 3
+        tolerance = 3
+        x = [0] * sample_size
+        y = [0] * sample_size
+        try:
+            for i in range(sample_size):
+                x[i] = self.bank.readInteger(registers.PS_TSX)
+                y[i] = self.bank.readInteger(registers.PS_TSY)
+        except OSError:
+            print("Failed to read touchscreen")
+            return (0, 0)
+        # Accept the touch only if the 3 samples agree (finger not sliding)
+        if statistics.pstdev(x) < tolerance and statistics.pstdev(y) < tolerance:
+            return (int(statistics.mean(x)), int(statistics.mean(y)))
+        return (0, 0)
+
+    def getKeyPressValue(self):
+        """Software F1–F4 keys: the right edge of the touchscreen (raw x > 300)
+        split into 4 bands of 60 px. Returns 8, 16, 24 or 40 (F1–F4), 0 if none."""
+        x, y = self.getTouchscreenCoordinates()
+        if x <= 300 or y <= 0:
+            return 0
+        band = min(3, (y - 1) // 60)
+        return [8, 16, 24, 40][band]
+
+    def isF1Pressed(self): return self.getKeyPressValue() == 8
+    def isF2Pressed(self): return self.getKeyPressValue() == 16
+    def isF3Pressed(self): return self.getKeyPressValue() == 24
+    def isF4Pressed(self): return self.getKeyPressValue() == 40
+
     def isTouched(self):
         """ Detects touch and updates self.x, self.y. """
-        tx, ty = self.comm.getTouchscreenCoordinates()
+        tx, ty = self.getTouchscreenCoordinates()
         if tx == 0 and ty == 0:
             return False
         # tx (PS_TSX): inverted, high=left → low=right across 320px

@@ -8,9 +8,9 @@ import threading
 
 from pistorms import PiStorms
 
-# Initialize PiStorms without resetting motors/encoders or clearing the LCD —
-# this service may (re)start while a robot program is running.
-psm = PiStorms(reset=False)
+# Initialize PiStorms without resetting motors/encoders or touching the
+# screen — this service may (re)start while a robot program is running.
+psm = PiStorms(reset=False, screen=False)
 
 # Fixed voltage threshold
 SAFE_VOLTAGE = 6.0  # volts for your NiMH pack

@@ -9,8 +9,8 @@ import numpy as np
 from PIL import Image as _PILImage
 from picamera2 import Picamera2
 from picamera2.devices import IMX500
-from pistorms import PiStorms, PiStormsSensor, PiStormsMotor
-from pistorms.devices import AbsoluteIMU
+from pistorms import PiStorms, PiStormsMotor
+from pistorms.devices import AbsoluteIMU, EV3InfraredSensor
 from rplidar import RPLidar
 from .robot_state import Pose, RobotState
 
@@ -24,13 +24,13 @@ class Sensor:
 
 
 class IR(Sensor):
-    def __init__(self, state: RobotState, irSensor: PiStormsSensor):
+    def __init__(self, state: RobotState, irSensor: EV3InfraredSensor):
         super().__init__(state)
         self.irSensor = irSensor
 
     def run(self):
         while self.state.running:
-            self.state.targetDistance = self.irSensor.distanceIREV3()
+            self.state.targetDistance = self.irSensor.proximity()
             time.sleep(0.02)
 
 

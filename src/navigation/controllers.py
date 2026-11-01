@@ -9,7 +9,7 @@ from abc import ABC, abstractmethod
 import math
 import time
 
-from pistorms import RampedMotor
+from .ramped_motor import RampedMotor
 from .robot_state import RobotState
 
 
@@ -135,9 +135,9 @@ class ManualController(Controller):
             # the bank-level 'S' command so neither wheel starts before the other.
             # setSpeedSyncPair handles the tacho-setpoint reset internally on
             # direction change, so no explicit reset call is needed here.
-            l = self.motorLeft._advance(-int(left))
-            r = self.motorRight._advance(-int(right))
-            self.motorLeft._motor.psmotor.setSpeedSyncPair(l, r)
+            l = self.motorLeft.advance(-int(left))
+            r = self.motorRight.advance(-int(right))
+            self.motorLeft.motor.setSpeedSyncPair(l, r)
 
     def stop(self):
         self._cur_base = self._cur_diff = 0.0

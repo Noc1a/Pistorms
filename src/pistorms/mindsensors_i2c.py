@@ -30,6 +30,7 @@
 
 import smbus
 import ctypes
+import threading
 import time
 
 # Transient bus errors (e.g. Errno 121 Remote I/O) are common on the PiStorms
@@ -40,6 +41,9 @@ import time
 I2C_RETRIES     = 3
 I2C_RETRY_DELAY = 0.002   # s
 SMBUS_BLOCK_MAX = 32      # smbus block transfers are limited to 32 bytes
+# Every Raspberry Pi since the 1 B rev 2 exposes the GPIO header I2C on bus 1
+# (bus 0 only existed on the very first boards).
+I2C_BUS = 1
 
 def _with_retries(fn, *args):
     for attempt in range(I2C_RETRIES):
@@ -54,41 +58,22 @@ def _with_retries(fn, *args):
 #  for read and write operations.
 class mindsensors_i2c(object):
 
-    @staticmethod
-    def pi_rev():
-        try:
-            with open('/proc/cpuinfo','r') as cpuinfo:
-                for line in cpuinfo: 
-                    if line.startswith('Hardware'):
-                        #print " rstrip output  " +str(line.rstrip()[-4:])
-                        cpu = 10 if line.rstrip()[-4:] in ['2709'] else 0
-                       
-                    if line.startswith('Revision'):
-                        # case '3' is for some rare pi board - Deepak
-                        #print " rstrip output  " +str(line.rstrip()[-4:])
-                        rev =  0 if line.rstrip()[-4:] in [ '0001', '0002','0003'] else 1
-                                        
-                         
-                #print "rev is ",rev        
-                return rev        
-                     
-        except:
-            return 0
-
-    @staticmethod
-    def which_bus():
-        return 1 if mindsensors_i2c.pi_rev() >= 1 else 0
-
     ## Initialize the class with the i2c address of your device
     #  @param self The object pointer.
     #  @param i2c_address Address of your device.
     def __init__(self, i2c_address):
         self.address = i2c_address
-        b = mindsensors_i2c.which_bus()
-        self.bus = smbus.SMBus(b)
+        self.bus = smbus.SMBus(I2C_BUS)
         # None = not probed yet; True/False = device does/doesn't return the
         # same bytes for a block read as for individual byte reads.
         self._block_read_ok = None
+        # One lock per device. A single transaction is already atomic in the
+        # kernel, but a SEQUENCE of transactions is not: a byte-by-byte read,
+        # or a motor command made of several writes (speed M1, speed M2, 'S'),
+        # must not be interleaved with another thread's command — otherwise a
+        # brake sent from one thread can be undone by the 'S' of a ramp step
+        # running in another. Reentrant, so a locked method may call another.
+        self.lock = threading.RLock()
         
     ## Prints an error message if a read error is detected
     #  @param self The object pointer.
@@ -137,31 +122,35 @@ class mindsensors_i2c(object):
     #  atomic; if the device doesn't support it, two identical byte-by-byte
     #  passes are required instead. Raises OSError if the bus keeps failing.
     def readArray(self, reg, length):
-        if self._block_read_ok is None:
-            self._probe_block_read()
-        if self._block_read_ok:
+        with self.lock:
+            if self._block_read_ok is None:
+                self._probe_block_read()
+            if not self._block_read_ok:
+                return self._readArrayConsistent(reg, length)
             result = []
             while length > 0:
-                n = min(length, SMBUS_BLOCK_MAX)
-                result += _with_retries(self.bus.read_i2c_block_data, self.address, reg, n)
-                reg += n
-                length -= n
+                chunk_length = min(length, SMBUS_BLOCK_MAX)
+                result += _with_retries(self.bus.read_i2c_block_data, self.address, reg, chunk_length)
+                reg += chunk_length
+                length -= chunk_length
             return result
-        return self._readArrayConsistent(reg, length)
 
     def _readArrayBytes(self, reg, length):
         return [self.readByte(reg + i) for i in range(length)]
 
     def _readArrayConsistent(self, reg, length):
-        prev = self._readArrayBytes(reg, length)
+        previous = self._readArrayBytes(reg, length)
         if length == 1:
-            return prev
-        for _ in range(I2C_RETRIES):
-            cur = self._readArrayBytes(reg, length)
-            if cur == prev:
-                return cur
-            prev = cur
-        return prev
+            return previous
+        for attempt in range(I2C_RETRIES):
+            current = self._readArrayBytes(reg, length)
+            if current == previous:
+                return current
+            previous = current
+        # The value kept changing between bytes: returning it could give a
+        # ±256 glitch (e.g. on an encoder), so report it like a bus error.
+        raise OSError(f"I2C 0x{self.address:02X}: reg 0x{reg:02X} changed during "
+                      f"{I2C_RETRIES + 1} byte-by-byte reads")
 
     def _probe_block_read(self):
         """Compare a block read of the (static) version string at 0x00 with
@@ -187,10 +176,9 @@ class mindsensors_i2c(object):
     #  @param reg The first register of the string to read from.
     #  @param length The length of the string.
     def readString(self, reg, length):
-        ss = ''
-        for x in range(0, length):
-            ss = ''.join([ss, chr(self.readByte(reg+x))])
-        return ss
+        with self.lock:
+            characters = [chr(self.readByte(reg + i)) for i in range(length)]
+        return ''.join(characters)
 
     ## Read an unsigned 16 bit integer from your i2c device from a given location.  Big-endian read integers .
     #  @param self The object pointer.
@@ -212,7 +200,7 @@ class mindsensors_i2c(object):
     #  @param int The integer to write.
     def writeInteger(self, reg, i):        
         i = int(i)
-        results = self.writeArray(reg, [i%256, (i>>8)%256])
+        self.writeArray(reg, [i % 256, (i >> 8) % 256])
 
     ## Read a signed 16 bit integer from your i2c device from a given location. Big endian read integers .
     #  @param self The object pointer.
@@ -267,7 +255,7 @@ class mindsensors_i2c(object):
         try:
             ver = self.readString(0x00, 8)
             return ver
-        except:
+        except OSError:
             print ("Error: Could not retrieve Firmware Version" )
             print ("Check I2C address and device connection to resolve issue")
             return ""
@@ -278,7 +266,7 @@ class mindsensors_i2c(object):
         try:
             vendor = self.readString(0x08, 8)
             return vendor
-        except:
+        except OSError:
             print("Error: Could not retrieve Vendor Name")
             print ("Check I2C address and device connection to resolve issue")
             return ""
@@ -289,7 +277,7 @@ class mindsensors_i2c(object):
         try:    
             device = self.readString(0x10, 8)
             return device
-        except:
+        except OSError:
             print ("Error: Could not retrieve Device ID")
             print ("Check I2C address and device connection to resolve issue")
             return ""
