@@ -35,6 +35,10 @@ class RobotState:
         # Correction from the odometry's frame to the map's: written by the
         # Slam thread at each scan, eased into self.pose by the Odometry thread
         self.odom_correction_target: tuple[float, float, float] = (0.0, 0.0, 0.0)
+        # The heading from each odometry source alone (the odometry mixes
+        # them, Odometry._wheel_weight): only recorded, to compare them with the SLAM
+        self.wheel_heading_rad: float = 0.0
+        self.gyro_heading_rad: float = 0.0
         self.targetPose = Pose(0, 0, 0.0)
         self.frontObstacleDistance = None
         # Collision guard (navigation.collision): free room in the robot's

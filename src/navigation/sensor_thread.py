@@ -59,7 +59,8 @@ class Odometry(Sensor):
     (right-handed). All raw sensor signs are corrected here so controllers
     can use atan2 directly.
 
-    Heading: complementary filter — α gyro / (1-α) wheel-differential.
+    Heading: complementary filter — α gyro / (1-α) wheel-differential in
+    turns, half and half while driving nearly straight (STRAIGHT_WHEEL_WEIGHT).
     Position: average wheel travel projected onto the midpoint heading.
 
     Madgwick + magnetometer were dropped: motor magnetic interference made the
@@ -68,7 +69,16 @@ class Odometry(Sensor):
     scan match) is needed for long-term accuracy."""
 
     PERIOD = 0.020         # 50 Hz
-    ALPHA  = 0.98          # gyro trust in heading fusion
+    ALPHA  = 0.98          # gyro trust in heading fusion (turns, pivots, standing)
+    # Driving nearly straight, the wheels get STRAIGHT_WHEEL_WEIGHT instead:
+    # rolling on the floor, the gyro's zero shifts 0.1–0.3 °/s (vibration;
+    # none with the robot on a stand), while the wheels, which skid 2–10 %
+    # in turns, are right in straight lines. Chosen 2026-11-07 by replaying 3
+    # runs against the SLAM (testSlam.py --straight / --out-and-back): mean
+    # heading error 2.9 / 0.7 / 1.2° instead of 5.5 / 3.5 / 2.8° with 98 % gyro.
+    STRAIGHT_WHEEL_WEIGHT  = 0.5
+    STRAIGHT_TURN_RATE_DPS = 10.0    # turning slower than this (gyro) = nearly straight
+    STRAIGHT_MIN_SPEED_MPS = 0.02    # … while driving at least this fast
     # IMU gyro filter (FIR order 0–7, set_gyro_filter). Measured 2026-11-07
     # with tests/testOdometryLag.py against the wheel encoders: the gyro lags
     # 85 ms with 7, 35 ms with 4, 25 ms with 0; noise at rest 0.08 / 0.18 /
@@ -128,6 +138,17 @@ class Odometry(Sensor):
         print(f"Gyro Z bias: {math.degrees(bias):+.3f} deg/s")
         return bias
 
+    def _wheel_weight(self, distance: float, d_theta_gyro: float, dt: float) -> float:
+        """Share of the wheels in this step's rotation: STRAIGHT_WHEEL_WEIGHT
+        while driving nearly straight, else 1 − ALPHA (the gyro leads)."""
+        if dt <= 0:
+            return 1 - self.ALPHA
+        speed = abs(distance) / dt
+        turn_rate_dps = abs(math.degrees(d_theta_gyro)) / dt
+        if speed >= self.STRAIGHT_MIN_SPEED_MPS and turn_rate_dps < self.STRAIGHT_TURN_RATE_DPS:
+            return self.STRAIGHT_WHEEL_WEIGHT
+        return 1 - self.ALPHA
+
     def _read_gyro_z(self) -> Optional[float]:
         """Raw gyro Z in deg/s, or None on I²C error: that sample then uses
         the wheels only."""
@@ -156,14 +177,19 @@ class Odometry(Sensor):
         # heading: complementary filter on rotation increments; without
         # a gyro sample, fall back to wheels only for this step
         d_theta_odom = (dr - dl) / self.wheel_base
+        distance = (dl + dr) / 2.0
         if gyr_z is None:
             d_theta = d_theta_odom
+            d_theta_gyro = d_theta_odom
         else:
             d_theta_gyro = (math.radians(gyr_z * self.GYRO_Z_SIGN)
                             - self._gyro_bias_z_rad) * dt
-            d_theta = self.ALPHA * d_theta_gyro + (1 - self.ALPHA) * d_theta_odom
-
-        distance = (dl + dr) / 2.0
+            wheel_weight = self._wheel_weight(distance, d_theta_gyro, dt)
+            d_theta = (1 - wheel_weight) * d_theta_gyro + wheel_weight * d_theta_odom
+        # Each source alone, for the comparison with the SLAM (recordings
+        # only: which one drifts less, driving straight and turning?)
+        self.state.wheel_heading_rad += d_theta_odom
+        self.state.gyro_heading_rad += d_theta_gyro
 
         # The SLAM's correction eases towards its latest target (no jump)
         if dt > 0:
@@ -441,6 +467,7 @@ class Slam(Sensor):
                 odom_pose = self.state.odom_pose
                 odom = (odom_pose.x, odom_pose.y, odom_pose.angle_rad)
                 published = (self.state.pose.x, self.state.pose.y, self.state.pose.angle_rad)
+                headings = (self.state.wheel_heading_rad, self.state.gyro_heading_rad)
             try:
                 update_start = time.monotonic()
                 pose = self.slam.update(points, odom)
@@ -462,7 +489,8 @@ class Slam(Sensor):
                         'update_secs': self.state.slam_update_secs,
                         'points': [list(point) for point in points],
                         'odom': list(odom), 'slam_pose': None if pose is None else list(pose),
-                        'published_pose': list(published)})
+                        'published_pose': list(published),
+                        'wheel_heading': headings[0], 'gyro_heading': headings[1]})
 
     def _update_correction(self, slam_pose: tuple, odom: tuple) -> None:
         """New correction target for the Odometry thread, unless the SLAM
