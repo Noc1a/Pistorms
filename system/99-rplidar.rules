@@ -1,0 +1,3 @@
+# RPLidar A1 (CP2102 USB adapter): stable name /dev/rplidar, and start the
+# service that keeps its motor stopped while no program uses it.
+SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", SYMLINK+="rplidar", TAG+="systemd", ENV{SYSTEMD_WANTS}+="lidar-pause.service"

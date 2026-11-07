@@ -178,7 +178,8 @@ class mindsensors_i2c(object):
     def readString(self, reg, length):
         with self.lock:
             characters = [chr(self.readByte(reg + i)) for i in range(length)]
-        return ''.join(characters)
+        # Shorter strings are padded with NUL bytes ('V1.20\x00\x00\x00')
+        return ''.join(characters).rstrip('\x00')
 
     ## Read an unsigned 16 bit integer from your i2c device from a given location.  Big-endian read integers .
     #  @param self The object pointer.

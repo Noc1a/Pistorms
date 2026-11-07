@@ -8,30 +8,109 @@ Motor wiring convention: setSpeed(-N) drives forward on this robot.
 from abc import ABC, abstractmethod
 import math
 import time
+from typing import Optional
 
-from .ramped_motor import RampedMotor
+from pistorms import PiStormsMotor
+
+from . import collision
 from .robot_state import RobotState
 
 
 # ════════════════════════════════════════════════════════════════════════════
 class Controller(ABC):
-    """Wraps raw motors in RampedMotor so no controller can apply a sudden
-    voltage step (which browns out the Pi). The wrapper's rate is loose enough
-    that controller-level kinematic ramping (Manual/Follow) passes through;
-    GoHome — which commands target speeds directly — gets ramping for free."""
+    """Every controller drives the wheels through _drive(): whatever speeds
+    it asks for, the wheels ramp to them (motor.py: both together, in %/s,
+    through 0 one percent at a time on a reversal), so the robot doesn't
+    jump and no current peak browns out the Pi. _drive() is also the
+    collision guard (navigation.collision): never drive the wheels any other
+    way while moving."""
 
-    def __init__(self, state: RobotState, motorLeft, motorRight):
+    ACCELERATION = 200   # %/s, every speed change of the wheels (50 % → 0 in 0.25 s)
+    MIN_START = 18       # %: below, a wheel doesn't move (static friction)
+
+    def __init__(self, state: RobotState, motorLeft: PiStormsMotor, motorRight: PiStormsMotor) -> None:
         self.state = state
-        self.motorLeft  = motorLeft  if isinstance(motorLeft,  RampedMotor) else RampedMotor(motorLeft)
-        self.motorRight = motorRight if isinstance(motorRight, RampedMotor) else RampedMotor(motorRight)
+        # Both motors are on the same bank: motorLeft's *Sync commands drive both
+        self.motorLeft: PiStormsMotor = motorLeft
+        self.motorRight: PiStormsMotor = motorRight
+        self._sent_speeds: Optional[tuple[int, int]] = None
 
     @abstractmethod
     def step(self):
         """Called repeatedly while this controller is active. Must be non-blocking."""
 
     def stop(self):
-        self.motorLeft.brake()
-        self.motorRight.brake()
+        """Ramp down, then brake: mode change, arrival. (Braking at once made
+        the robot jump; the safety stops — collision guard, end of the
+        program — still brake at once.)"""
+        self.motorLeft.brakeSync(acceleration=self.ACCELERATION, blocking=False)
+        self._sent_speeds = None
+
+    def _drive(self, left: float, right: float) -> None:
+        """Ramp both wheels to these motor speeds (−100…100, negative =
+        forward). The ramp runs in the background: it is sent only when the
+        speeds change. (0, 0) ramps down, then brakes (stops a spin).
+
+        Collision guard, checked at every call: driving towards an obstacle
+        in the robot's corridor (closer than its stopping distance) is
+        removed from the command; turning and moving away stay. When that
+        stops a motion towards the obstacle, the wheels brake at once."""
+        left, right, blocked = self._guarded(left, right)
+        speeds = (round(self._apply_min_speed(left, self.MIN_START)),
+                  round(self._apply_min_speed(right, self.MIN_START)))
+        was_driving_into_it = blocked is not None and blocked != self.state.blocked
+        self._set_blocked(blocked)
+        if was_driving_into_it:
+            self.motorLeft.brakeSync()          # now: no room left for a ramp
+            self._sent_speeds = (0, 0)
+        if speeds == self._sent_speeds:
+            return
+        self._sent_speeds = speeds
+        if speeds == (0, 0):
+            self.motorLeft.brakeSync(acceleration=self.ACCELERATION, blocking=False)
+        else:
+            self.motorLeft.setSpeedSyncPair(*speeds, acceleration=self.ACCELERATION, blocking=False)
+
+    def _guarded(self, left: float, right: float) -> tuple[float, float, Optional[str]]:
+        """The command without its part towards an obstacle: (left, right,
+        'front' / 'rear' / None). The command splits into a forward part
+        (both wheels alike) and a turn part (wheels opposite)."""
+        forward = -(left + right) / 2           # > 0: forward (motor speeds are negative forward)
+        turn = (left - right) / 2
+        blocked = self._blocked_direction(forward)
+        if blocked is not None:
+            forward = 0.0
+        return -forward + turn, -forward - turn, blocked
+
+    def _blocked_direction(self, forward: float) -> Optional[str]:
+        """'front' if driving forward would hit something, 'rear' backward,
+        else None. Clearances older than MAX_SCAN_AGE_SECS (LiDAR stopped)
+        block both ways."""
+        if forward == 0:
+            return None
+        clearances_age = time.monotonic() - self.state.clearance_time
+        trusted = clearances_age <= collision.MAX_SCAN_AGE_SECS
+        # The faster of the measured and the commanded speed: with the measured
+        # one alone, a robot stopped near a wall would start again, creeping on
+        speed = max(abs(self.state.speed_mps), abs(forward) * collision.SPEED_MPS_PER_PERCENT)
+        room_needed = collision.stop_distance(speed)
+        if forward > 0 and (not trusted or self.state.front_clearance_m < room_needed):
+            return 'front'
+        if forward < 0 and (not trusted or self.state.rear_clearance_m < room_needed):
+            return 'rear'
+        return None
+
+    def _set_blocked(self, blocked: Optional[str]) -> None:
+        if blocked == self.state.blocked:
+            return
+        if blocked is None:
+            print("Collision guard: free again", flush=True)
+        elif time.monotonic() - self.state.clearance_time > collision.MAX_SCAN_AGE_SECS:
+            print(f"Collision guard: no recent LiDAR scan — {blocked} blocked", flush=True)
+        else:
+            clearance = self.state.front_clearance_m if blocked == 'front' else self.state.rear_clearance_m
+            print(f"Collision guard: obstacle {clearance * 100:.0f} cm {blocked} — stopped", flush=True)
+        self.state.blocked = blocked
 
     # ── shared helpers ──
     @staticmethod
@@ -66,11 +145,10 @@ class Controller(ABC):
 class ManualController(Controller):
     """Drives motors from state.manual_cmd = {'fwd': -1..1, 'turn': -1..1, 'speed': 0..100}.
 
-    Release feels instant: cur_base/cur_diff snap to 0 when target is 0 so the
-    robot stops turning the moment the key is released. Growing magnitude ramps
-    with ACC (voltage-safe soft start); shrinking magnitude or direction reversal
-    also snaps — the wrapper's ACC=8 still guards true zero-to-max wheel jumps,
-    but the wrapper's loose DEC lets these snaps through without extra clamping.
+    cur_base/cur_diff follow the keys: they snap to 0 on release and on a
+    reversal, and ramp with MAX_STEP_ACC when growing. The wheels themselves
+    always follow them through _drive() (ramped, both together), which on
+    release ramps down then brakes, so that a turn stops.
     """
     MAX_STEP_ACC = 4      # smooth acceleration for taps
     TURN_WEIGHT  = 0.6    # fraction of speed used for turn component
@@ -79,7 +157,6 @@ class ManualController(Controller):
         super().__init__(state, motorLeft, motorRight)
         self._cur_base = 0.0
         self._cur_diff = 0.0
-        self._braking  = False
 
     def _step_component(self, target, cur):
         # Snap on release or magnitude shrink → responsive feel.
@@ -121,23 +198,9 @@ class ManualController(Controller):
                   f"L={left:+6.1f} R={right:+6.1f}", flush=True)
             self._last_log_sig = sig
 
-        # Brake actively on full release: setSpeed(0) coasts, letting angular
-        # momentum from a preceding turn keep spinning the robot. brake() holds
-        # position — critical to kill spin before the next command.
-        if left == 0 and right == 0:
-            if not self._braking:
-                self.motorLeft.brakeSync()
-                self.motorRight.brake()
-                self._braking = True
-        else:
-            self._braking = False
-            # Ramp both wheels then fire the two speed registers atomically via
-            # the bank-level 'S' command so neither wheel starts before the other.
-            # setSpeedSyncPair handles the tacho-setpoint reset internally on
-            # direction change, so no explicit reset call is needed here.
-            l = self.motorLeft.advance(-int(left))
-            r = self.motorRight.advance(-int(right))
-            self.motorLeft.motor.setSpeedSyncPair(l, r)
+        # On full release the wheels ramp down to 0, then brake: the brake
+        # holds position and kills the spin of a preceding turn
+        self._drive(-left, -right)
 
     def stop(self):
         self._cur_base = self._cur_diff = 0.0
@@ -180,8 +243,7 @@ class FollowObjectController(Controller):
             self._cur_turn = self._ramp(self._cur_turn, self.SEARCH_TURN, 2)
             left  = self._cur_base + self._cur_turn
             right = self._cur_base - self._cur_turn
-            self.motorLeft.setSpeed(-int(left))
-            self.motorRight.setSpeed(-int(right))
+            self._drive(-left, -right)
             self._moving = True
             return
 
@@ -204,8 +266,7 @@ class FollowObjectController(Controller):
             left, right = self._scale_motors(left, right, self.MAX_MOTOR)
             left  = self._apply_min_speed(left,  self.MIN_SPEED)
             right = self._apply_min_speed(right, self.MIN_SPEED)
-            self.motorLeft.setSpeed(-int(left))
-            self.motorRight.setSpeed(-int(right))
+            self._drive(-left, -right)
             self._moving = True
         elif self._moving:
             self._cur_base = self._ramp(self._cur_base, 0.0, self.MAX_STEP_DEC)
@@ -213,13 +274,11 @@ class FollowObjectController(Controller):
             left  = self._cur_base + self._cur_turn
             right = self._cur_base - self._cur_turn
             if abs(left) < 1 and abs(right) < 1:
-                self.motorLeft.brake()
-                self.motorRight.brake()
+                self._drive(0, 0)     # ramps down, then brakes at 0
                 self._cur_base = self._cur_turn = 0.0
                 self._moving = False
             else:
-                self.motorLeft.setSpeed(-int(left))
-                self.motorRight.setSpeed(-int(right))
+                self._drive(-left, -right)
 
     def stop(self):
         self._cur_base = self._cur_turn = 0.0
@@ -248,7 +307,9 @@ class GoHomeController(Controller):
 
     HEADING_TOLERANCE  = math.radians(3)
     ARRIVAL_TOLERANCE  = 0.10        # m
-    OBSTACLE_THRESHOLD = 350         # mm
+    # Sidestep when the robot's corridor (navigation.collision) is free for
+    # less than this in front of the nose (the old 35 cm from the LiDAR centre)
+    AVOID_CLEARANCE_M  = 0.25
     DRIVE_SPEED        = 25
     TURN_SPEED         = 22
     AVOID_DURATION     = 1.5         # s of forward after sidestep turn
@@ -287,13 +348,13 @@ class GoHomeController(Controller):
             self._phase = self.PHASE_DRIVE
             return
         s = self.TURN_SPEED if err > 0 else -self.TURN_SPEED
-        self.motorLeft.setSpeed(-int(-s))   # s > 0: left backward, right forward → CCW (left)
-        self.motorRight.setSpeed(-int(s))
+        self._drive(s, -s)   # s > 0: left backward, right forward → CCW (left)
 
     def _step_drive(self, x, y, heading):
         # obstacle ahead?
-        front = self.state.frontObstacleDistance
-        if front is not None and front < self.OBSTACLE_THRESHOLD:
+        # The whole width of the robot, not the ±10° cone of frontObstacleDistance
+        # (±2 cm wide near the nose: it let the robot hit a chair leg)
+        if self.state.front_clearance_m < self.AVOID_CLEARANCE_M:
             self._avoid_dir   = self._pick_avoidance_side()
             self._avoid_until = time.monotonic() + self.AVOID_DURATION
             self._phase = self.PHASE_AVOID
@@ -308,8 +369,7 @@ class GoHomeController(Controller):
         correction = max(-self.DRIVE_SPEED, min(self.DRIVE_SPEED, self.HEADING_KP * err))
         left  = self.DRIVE_SPEED - correction   # err > 0 → right wheel faster → turn left
         right = self.DRIVE_SPEED + correction
-        self.motorLeft.setSpeed(-int(left))
-        self.motorRight.setSpeed(-int(right))
+        self._drive(-left, -right)
 
     def _step_avoid(self):
         if time.monotonic() < self._avoid_until:
@@ -317,22 +377,19 @@ class GoHomeController(Controller):
             turn = self._avoid_dir * self.TURN_SPEED * 0.7
             left  = self.DRIVE_SPEED - turn     # _avoid_dir +1 → right wheel faster → turn left
             right = self.DRIVE_SPEED + turn
-            self.motorLeft.setSpeed(-int(left))
-            self.motorRight.setSpeed(-int(right))
+            self._drive(-left, -right)
         else:
             self._phase = self.PHASE_TURN     # re-aim at home
 
     def _step_final_turn(self, heading):
         err = self._normalize_angle(0.0 - heading)
         if abs(err) <= self.HEADING_TOLERANCE:
-            self.motorLeft.brake()
-            self.motorRight.brake()
+            self.stop()                       # arrived: ramp down, then brake
             self._phase = self.PHASE_TURN     # reset for next invocation
             self.state.mode = RobotState.MODE_MANUAL
             return
         s = self.TURN_SPEED if err > 0 else -self.TURN_SPEED
-        self.motorLeft.setSpeed(-int(-s))
-        self.motorRight.setSpeed(-int(s))
+        self._drive(s, -s)
 
     # ── helpers ──
     def _pick_avoidance_side(self):

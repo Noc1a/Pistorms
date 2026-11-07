@@ -2,8 +2,13 @@ from abc import abstractmethod
 from math import cos, sin
 import math
 import io
+import json
+import multiprocessing
+import queue
 import threading
 import time
+from typing import Optional
+
 import numpy as np
 
 from PIL import Image as _PILImage
@@ -11,8 +16,9 @@ from picamera2 import Picamera2
 from picamera2.devices import IMX500
 from pistorms import PiStorms, PiStormsMotor
 from pistorms.devices import AbsoluteIMU, EV3InfraredSensor
-from rplidar import RPLidar
+from . import collision, lidar_reader, pose_correction
 from .robot_state import Pose, RobotState
+from .slam import ODOMETRY_LAG_SECS, LidarSlam
 
 
 class Sensor:
@@ -63,8 +69,19 @@ class Odometry(Sensor):
 
     PERIOD = 0.020         # 50 Hz
     ALPHA  = 0.98          # gyro trust in heading fusion
+    # IMU gyro filter (FIR order 0–7, set_gyro_filter). Measured 2026-11-07
+    # with tests/testOdometryLag.py against the wheel encoders: the gyro lags
+    # 85 ms with 7, 35 ms with 4, 25 ms with 0; noise at rest 0.08 / 0.18 /
+    # 0.24 °/s (≈0.2° per minute of heading at most: negligible). 4, the
+    # factory value, is the compromise. Every test that reads the gyro for
+    # the odometry uses this value. The lag is compensated by the SLAM
+    # (navigation/slam.py, ODOMETRY_LAG_SECS).
+    GYRO_FILTER = 4
     TICKS_PER_REV = 360.0
     GYRO_CAL_SAMPLES = 300
+    SPEED_SMOOTHING = 0.2      # state.speed_mps: share of each new sample (~0.1 s at 50 Hz)
+    LIDAR_WAIT_SECS = 15.0     # longest wait for the LiDAR to turn before the bias calibration
+    LIDAR_SETTLE_SECS = 1.0    # then let its vibration settle
 
     # Sign conventions (measured in tests/testOdometryAccuracy.py):
     # setSpeed(-N) drives forward, and encoders count in the commanded
@@ -88,13 +105,19 @@ class Odometry(Sensor):
         self.wheel_circumference = math.pi * wheel_diameter
         self.wheel_base = wheel_base
         self._gyro_bias_z_rad = 0.0
+        # SLAM correction applied to state.pose, easing towards
+        # state.odom_correction_target (navigation.pose_correction)
+        self._correction: pose_correction.Correction = pose_correction.IDENTITY
+        # Set once the gyro bias is calibrated and the pose starts updating:
+        # the robot must stand still until then
+        self.ready: threading.Event = threading.Event()
 
     def _calibrate_gyro_bias(self):
         """Average gyro Z while robot is stationary. Returns bias in rad/s."""
         print("Calibrating gyro bias — hold still...")
         samples = []
         for _ in range(self.GYRO_CAL_SAMPLES):
-            gyr_z = self.imu.get_gyroz()
+            gyr_z = self._read_gyro_z()
             if gyr_z is not None:
                 samples.append(gyr_z * self.GYRO_Z_SIGN)
             time.sleep(0.005)
@@ -104,6 +127,15 @@ class Odometry(Sensor):
         bias = math.radians(float(np.mean(samples)))
         print(f"Gyro Z bias: {math.degrees(bias):+.3f} deg/s")
         return bias
+
+    def _read_gyro_z(self) -> Optional[float]:
+        """Raw gyro Z in deg/s, or None on I²C error: that sample then uses
+        the wheels only."""
+        try:
+            return self.imu.gyro('z')
+        except OSError as e:
+            print(f"Odometry: gyro read failed ({e!r}) — wheels only for this sample")
+            return None
 
     def _read_ticks(self):
         """Both encoders as forward-positive tick counts, or None on I²C error."""
@@ -133,17 +165,38 @@ class Odometry(Sensor):
 
         distance = (dl + dr) / 2.0
 
+        # The SLAM's correction eases towards its latest target (no jump)
+        if dt > 0:
+            self._correction = pose_correction.blended(
+                self._correction, self.state.odom_correction_target,
+                min(1.0, dt / pose_correction.SMOOTHING_SECS))
         with self.state._pose_lock:
-            heading_mid = self.state.pose.angle_rad + d_theta / 2.0
-            self.state.pose.angle_rad += d_theta
-            self.state.pose.x += distance * cos(heading_mid)
-            self.state.pose.y += distance * sin(heading_mid)
+            odom = self.state.odom_pose
+            heading_mid = odom.angle_rad + d_theta / 2.0
+            odom.angle_rad += d_theta
+            odom.x += distance * cos(heading_mid)
+            odom.y += distance * sin(heading_mid)
+            # Published pose: the odometry in the map's frame
+            pose = self.state.pose
+            pose.x, pose.y, pose.angle_rad = pose_correction.apply(
+                self._correction, (odom.x, odom.y, odom.angle_rad))
+        # Forward speed for the collision guard's stopping distance, smoothed
+        # over ~0.1 s (5 samples at 50 Hz)
+        if dt > 0:
+            self.state.speed_mps += (distance / dt - self.state.speed_mps) * self.SPEED_SMOOTHING
 
     def run(self):
         try:
-            self.imu.set_gyro_filter(7)
+            self.imu.set_gyro_filter(self.GYRO_FILTER)
         except OSError as e:
             print(f"Odometry: could not set gyro filter ({e!r})")
+        # Measure the bias with the LiDAR turning, as it will be: its
+        # vibration shifts the gyro by ~0.13 °/s. Without it, a calibration
+        # done LiDAR off drifted the heading ~0.11 °/s (live run 2026-11-07)
+        if self.state.lidar_spinning.wait(timeout=self.LIDAR_WAIT_SECS):
+            time.sleep(self.LIDAR_SETTLE_SECS)
+        else:
+            print("Odometry: no LiDAR turning — gyro bias measured without it")
         self._gyro_bias_z_rad = self._calibrate_gyro_bias()
 
         ticks = None
@@ -154,11 +207,12 @@ class Odometry(Sensor):
         if ticks is None:
             return
         ticks_left_prev, ticks_right_prev = ticks
+        self.ready.set()
 
         t0 = time.monotonic()
         while self.state.running:
             try:
-                gyr_z = self.imu.get_gyroz()
+                gyr_z = self._read_gyro_z()
                 ticks = self._read_ticks()
 
                 now = time.monotonic()
@@ -281,58 +335,162 @@ class Camera(Sensor):
 
 
 class Lidar(Sensor):
+    """The LiDAR, read in a process of its own (navigation.lidar_reader: the
+    camera, the SLAM and the web server no longer slow the reading). This
+    thread receives each scan, works out the target and front obstacle
+    distances, keeps it for web_viz (state.last_scan) and hands it to the
+    Slam thread."""
+
     def __init__(self, state: RobotState, portName: str = '/dev/ttyUSB0'):
         super().__init__(state)
         self.portName = portName
-        self.lidar = RPLidar(self.portName)
 
-    def _reconnect(self):
-        """Reset the lidar cleanly — used after a stale/corrupt session leaves
-        get_health() returning a 3-tuple that the library can't unpack."""
-        try: self.lidar.stop()
-        except Exception: pass
-        try: self.lidar.disconnect()
-        except Exception: pass
-        time.sleep(1.0)
-        self.lidar = RPLidar(self.portName)
+    def _hand_to_slam(self, scan_time: float, scan: list, serial_bytes_waiting: int) -> None:
+        """Queue the scan for the Slam thread, never blocking: if the queue
+        is full (Slam behind, or not running), the oldest scan is dropped."""
+        item = (scan_time, scan, serial_bytes_waiting)
+        try:
+            self.state.slam_scans.put_nowait(item)
+        except queue.Full:
+            try:
+                self.state.slam_scans.get_nowait()
+                self.state.slam_scans_dropped += 1
+            except queue.Empty:
+                pass
+            self.state.slam_scans.put_nowait(item)
 
     def run(self):
-        # max_buf_meas: larger buffer tolerates brief consumer stalls without warnings
-        backoff = 1.0
+        # 'spawn': a fresh process, safe in a program that already runs threads
+        context = multiprocessing.get_context('spawn')
+        scans = context.Queue(maxsize=lidar_reader.SCANS_QUEUE_SIZE)
+        stop = context.Event()
+        reader = context.Process(target=lidar_reader.read_lidar, args=(self.portName, scans, stop),
+                                 name='lidar_reader', daemon=True)
+        reader.start()
+        try:
+            while self.state.running:
+                try:
+                    scan_time, scan, serial_bytes_waiting = scans.get(timeout=1.0)
+                except queue.Empty:
+                    continue
+                self.state.lidar_spinning.set()
+
+                min_target_distance = float('inf')
+                min_front_distance  = float('inf')
+                lidar_target_angle  = self.state.targetPose.get_angle_deg() % 360
+
+                for (quality, angle, distance) in scan:
+                    if quality == 0 or distance <= 0:
+                        continue
+                    angle_diff = abs((angle - lidar_target_angle + 180) % 360 - 180)
+                    if angle_diff <= 5 and distance < 2000:
+                        min_target_distance = min(min_target_distance, distance)
+                    is_front = angle <= 10 or angle >= 350
+                    if is_front and distance < 300:
+                        min_front_distance = min(min_front_distance, distance)
+
+                self.state.last_scan = [[q, a, d] for q, a, d in scan]
+                self._hand_to_slam(scan_time, scan, serial_bytes_waiting)
+                self.state.targetDistance        = min_target_distance if min_target_distance != float('inf') else None
+                self.state.frontObstacleDistance = min_front_distance  if min_front_distance  != float('inf') else None
+                # Collision guard: free room in the robot's corridor (Controller._drive)
+                self.state.front_clearance_m, self.state.rear_clearance_m = collision.clearances(scan)
+                self.state.clearance_time = scan_time
+        finally:
+            # The reader stops its scan and its motor, then ends
+            stop.set()
+            reader.join(timeout=3.0)
+            if reader.is_alive():
+                reader.terminate()
+
+
+class Slam(Sensor):
+    """SLAM (navigation.slam.LidarSlam) on every scan of the Lidar thread
+    (state.slam_scans) and the Odometry thread's raw pose (state.odom_pose).
+    Writes state.slam_pose, state.slam_update_secs and the correction that
+    keeps state.pose on the map (state.odom_correction_target,
+    navigation.pose_correction); the map: state.slam.map_image().
+
+    Each scan is matched with the odometry of ODOMETRY_LAG_SECS after its
+    end (the odometry lags the robot): the thread waits that long first.
+    A scan the SLAM is too slow for is dropped by the Lidar thread; the
+    odometry still covers the move between two used scans.
+
+    record=True keeps every scan with its timing and odometry, for
+    save_recording() (a run tests/testSlam.py replays): ~15 MB per minute."""
+
+    def __init__(self, state: RobotState, record: bool = False):
+        super().__init__(state)
+        self.slam: LidarSlam = LidarSlam()
+        state.slam = self.slam              # for the map pictures (web_viz, screen)
+        self.record = record
+        self.recording: list[dict] = []
+        self._recording_lock = threading.Lock()
+        self._last_poses: Optional[tuple[tuple, tuple]] = None    # (SLAM pose, odometry) of the last update
+
+    def run(self):
         while self.state.running:
             try:
-                for scan in self.lidar.iter_scans(max_buf_meas=6000):
-                    backoff = 1.0  # got a scan — reset backoff
-                    if not self.state.running:
-                        break
-
-                    min_target_distance = float('inf')
-                    min_front_distance  = float('inf')
-                    lidar_target_angle  = self.state.targetPose.get_angle_deg() % 360
-
-                    for (quality, angle, distance) in scan:
-                        if quality == 0 or distance <= 0:
-                            continue
-                        angle_diff = abs((angle - lidar_target_angle + 180) % 360 - 180)
-                        if angle_diff <= 5 and distance < 2000:
-                            min_target_distance = min(min_target_distance, distance)
-                        is_front = angle <= 10 or angle >= 350
-                        if is_front and distance < 300:
-                            min_front_distance = min(min_front_distance, distance)
-
-                    self.state.last_scan = [[q, a, d] for q, a, d in scan]
-                    self.state.targetDistance        = min_target_distance if min_target_distance != float('inf') else None
-                    self.state.frontObstacleDistance = min_front_distance  if min_front_distance  != float('inf') else None
+                scan_time, points, serial_bytes_waiting = self.state.slam_scans.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            received = time.monotonic()
+            time.sleep(max(0.0, scan_time + ODOMETRY_LAG_SECS - time.monotonic()))
+            # The raw odometry: what the SLAM needs (deskewing, predicted move)
+            with self.state._pose_lock:
+                odom_pose = self.state.odom_pose
+                odom = (odom_pose.x, odom_pose.y, odom_pose.angle_rad)
+                published = (self.state.pose.x, self.state.pose.y, self.state.pose.angle_rad)
+            try:
+                update_start = time.monotonic()
+                pose = self.slam.update(points, odom)
+                self.state.slam_update_secs = time.monotonic() - update_start
             except Exception as e:
-                if not self.state.running: break
-                print(f"Lidar error: {e!r} — reconnecting in {backoff:.1f}s")
-                time.sleep(backoff)
-                backoff = min(backoff * 2, 15.0)
-                try: self._reconnect()
-                except Exception as e2:
-                    print(f"Lidar reconnect failed: {e2!r}")
+                # never let one bad scan kill the thread
+                print(f"Slam error: {e!r}")
+                continue
+            if pose is not None:
+                x, y, theta = pose
+                self.state.slam_pose = Pose(x, y, theta, scan_time)
+                self._update_correction(pose, odom)
+            if self.record:
+                with self._recording_lock:
+                    self.recording.append({
+                        'monotonic': scan_time, 'received': received,
+                        'serial_bytes_waiting': serial_bytes_waiting,
+                        'dropped_so_far': self.state.slam_scans_dropped,
+                        'update_secs': self.state.slam_update_secs,
+                        'points': [list(point) for point in points],
+                        'odom': list(odom), 'slam_pose': None if pose is None else list(pose),
+                        'published_pose': list(published)})
 
-        try: self.lidar.stop()
-        except Exception: pass
-        try: self.lidar.disconnect()
-        except Exception: pass
+    def _update_correction(self, slam_pose: tuple, odom: tuple) -> None:
+        """New correction target for the Odometry thread, unless the SLAM
+        jumped (moved differently from the odometry since its last update)."""
+        if self._last_poses is not None:
+            previous_slam, previous_odom = self._last_poses
+            if pose_correction.slam_jumped(previous_slam, slam_pose, previous_odom, odom):
+                print("Slam: pose jumped against the odometry — correction kept", flush=True)
+                self._last_poses = (slam_pose, odom)
+                return
+        self._last_poses = (slam_pose, odom)
+        self.state.odom_correction_target = pose_correction.correction_between(slam_pose, odom)
+
+    def save_recording(self, path: str) -> None:
+        """Write the recorded scans as a testSlam.py run (scenario 'live').
+        The odometry of each scan was already read ODOMETRY_LAG_SECS after
+        it: the replay must not shift it again (odometry_lag_secs = 0)."""
+        with self._recording_lock:
+            scans = list(self.recording)
+        if not scans:
+            return
+        start = scans[0]['monotonic']
+        for scan in scans:
+            scan['t'] = scan['monotonic'] - start
+            scan['phase'] = 'live'
+        run = {'scenario': 'live', 'date': time.strftime('%Y-%m-%dT%H:%M:%S'),
+               'odometry_lag_secs': 0.0, 'live_odometry_lag_secs': ODOMETRY_LAG_SECS,
+               'scans': scans}
+        with open(path, 'w') as f:
+            json.dump(run, f)
+        print(f"SLAM recording saved: {path} ({len(scans)} scans)")

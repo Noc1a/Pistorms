@@ -1,232 +1,186 @@
 import math
 import struct
 import time
+from typing import Literal, NamedTuple, Optional
 
+from ..sensor_port import SensorPort
 from .ms_device import MindsensorsI2CDevice
+
+Axis = Literal['x', 'y', 'z']
+AXES: tuple[Axis, Axis, Axis] = ('x', 'y', 'z')
+
+
+class Vector3(NamedTuple):
+    """A reading of the 3 axes: imu.gyro_all().z, or x, y, z = imu.accel_all()."""
+    x: float
+    y: float
+    z: float
 
 
 class AbsoluteIMU(MindsensorsI2CDevice):
-    """mindsensors AbsoluteIMU. Unlike the other devices, the getters return
-    None (or a tuple of None) on a bus error: the robot's sensor threads
-    rely on it."""
+    """mindsensors AbsoluteIMU-ACG: accelerometer, compass, magnetometer, gyro.
 
-    ABSIMU_ADDRESS = (0x22)
-    COMMAND  = 0x41
-    TILT_X   = 0x42
-    TILT_Y   = 0x43
-    TILT_Z   = 0x44
-    ACCEL_X  = 0x45
-    ACCEL_Y  = 0x47
-    ACCEL_Z  = 0x49
-    CMPS     = 0x4B
-    MAG_X    = 0x4D
-    MAG_Y    = 0x4F
-    MAG_Z    = 0x51
-    GYRO_X   = 0x53
-    GYRO_Y   = 0x55
-    GYRO_Z   = 0x57
-    GYRO_FILTER = 0x5A
+    Each sensor reads all its axes (gyro_all(), 6 bytes) or one axis
+    (gyro('z'), 2 bytes: faster, for the 50 Hz odometry).
 
-    DEFAULT_ADDRESS = ABSIMU_ADDRESS
+    Bus errors raise OSError, like the rest of the library. Units, checked
+    on the robot (mindsensorsDevices skill, references/absolute_imu.md):
+        accel m/s², gyro °/s, tilt and compass in degrees,
+        magnetometer in "pseudo-nT" (see MAG_SCALE).
+    """
 
-    gyro_unit = 8.75
+    DEFAULT_ADDRESS = 0x22
 
-    def get_acc_mag_gyr(self):
-        """Single 20-byte block read from ACCEL_X — returns (acc m/s², mag nT, gyr deg/s).
-        Re-activates the sensor port before EVERY read (validated on the robot, kept as
-        is): PiStorms silently reverts the port to NONE after ~1s idle, and the IMU needs
-        a few ms to respond after re-arming, so we retry with a settle delay.
-        Returns (None,None,None) if all attempts fail."""
-        for attempt in range(3):
-            self.port.activateCustomSensorI2C()
-            if attempt > 0:
-                time.sleep(0.05)
-            # The port was just re-activated: tell _keepPortActive, so that
-            # another getter called soon after doesn't wait for a re-activation
-            self._last_access = time.monotonic()
-            try:
-                raw = self.bus.read_i2c_block_data(self.address, self.ACCEL_X, 20)
-                break
-            except Exception as e:
-                last_err = e
-        else:
-            print(f"get_acc_mag_gyr I2C error: {last_err}")
-            return None, None, None
-        acc_raw  = struct.unpack("<3h", bytes(raw[0:6]))    # ACCEL_X..ACCEL_Z
-        mag_raw  = struct.unpack("<3h", bytes(raw[8:14]))   # MAG_X..MAG_Z   (skip CMPS 2 bytes)
-        gyro_raw = struct.unpack("<3h", bytes(raw[14:20]))  # GYRO_X..GYRO_Z
-        return self._convert_acc(acc_raw), self._convert_mag(mag_raw), self._convert_gyro(gyro_raw)
+    # Registers. 16-bit values are little-endian signed, X then Y then Z.
+    # Firmware tilt, one byte per axis (128 = level): NOT used by tilt(). It
+    # is asin(a/g) on one byte, which overflows near +1 g (255 → 0: an axis
+    # pointing down reads −90°) and clips near −1 g; measured 2026-11-06
+    # (mindsensorsDevices skill, absolute_imu.md). Read only by
+    # tests/testAbsoluteIMU.py to show the fault.
+    TILT_REGISTERS = 0x42
+    ACCEL       = 0x45   # milli-g
+    HEADING     = 0x4B   # compass, degrees 0–359
+    MAG         = 0x4D   # raw magnetic field
+    GYRO        = 0x53   # raw rate, × the unit of the sensitivity level
+    GYRO_FILTER = 0x5A   # 0–7
 
-    def get_all_values(self):
-        """Single 23-byte block read from TILT_X. Returns (tilt, compass, gyr deg/s, acc m/s², mag nT), or (None,...) on error."""
-        try:
-            self._keepPortActive()
-            raw = self.bus.read_i2c_block_data(self.address, self.TILT_X, 23)
-        except Exception:
-            return None, None, None, None, None
-        result = struct.unpack("<3b10h", bytes(raw))
-        return result[0:3], result[6], self._convert_gyro(result[10:13]), self._convert_acc(result[3:6]), self._convert_mag(result[7:10])
+    # The 4 sensitivity levels, by accelerometer range (g): one command sets
+    # both ranges. → (command, gyro range °/s, gyro milli-degrees/s per raw unit).
+    # Levels 3 and 4 share the gyro range: only the accelerometer differs.
+    SENSITIVITIES = {
+        2:  ('1', 250, 8.75),
+        4:  ('2', 500, 17.5),
+        8:  ('3', 2000, 70.0),
+        16: ('4', 2000, 70.0),
+    }
+    # The guide says 50 ms after a sensitivity command, but measured on the
+    # robot (2026-11-01) the accelerometer reads up to +110 % for 0.3–0.4 s
+    # after a change (e.g. 2092 instead of 1000 milli-g at rest): wait 0.5 s.
+    SENSITIVITY_SETTLE_TIME = 0.5
 
-    def get_tiltx(self):
-        try:
-            t = self.readByteSigned(self.TILT_X)
-            return math.degrees(math.asin(max(-1.0, min(1.0, t / 128.0))))
-        except Exception:
-            return None
+    ACCEL_SCALE = 9.80665 / 1000   # milli-g → m/s²
+    # The guide gives no magnetometer unit. This conversion (origin unknown)
+    # is kept because the calibration files (mag_calibration*.json) are
+    # expressed in it, but it reads the earth's field ≈1.8× too small on the
+    # robot (≈26 instead of 48 µT): "pseudo-nT", fine for relative use only.
+    MAG_SCALE = 1 / 0.03432
+    MAG_SIGNS = Vector3(1, -1, -1)
+    NO_SIGN_CHANGE = Vector3(1, 1, 1)
 
-    def get_tilty(self):
-        try:
-            t = self.readByteSigned(self.TILT_Y)
-            return math.degrees(math.asin(max(-1.0, min(1.0, t / 128.0))))
-        except Exception:
-            return None
+    def __init__(self, port: SensorPort, address: Optional[int] = None,
+                 accel_range_g: int = 2) -> None:
+        super().__init__(port, address)
+        # The IMU keeps its sensitivity until power-off, whatever program set
+        # it: set it here so that the gyro unit is always the right one
+        self.set_sensitivity(accel_range_g)
 
-    def get_tiltz(self):
-        try:
-            t = self.readByteSigned(self.TILT_Z)
-            return math.degrees(math.asin(max(-1.0, min(1.0, t / 128.0))))
-        except Exception:
-            return None
+    def set_sensitivity(self, accel_range_g: int) -> None:
+        """Sensitivity level, by accelerometer range:
+            2 → ±2 g,  gyro ±250 °/s (default)
+            4 → ±4 g,  gyro ±500 °/s
+            8 → ±8 g,  gyro ±2000 °/s
+            16 → ±16 g, gyro ±2000 °/s"""
+        command, gyro_range_dps, gyro_milli_degrees_per_unit = self.SENSITIVITIES[accel_range_g]
+        self.command(ord(command))
+        time.sleep(self.SENSITIVITY_SETTLE_TIME)
+        self.accel_range_g: int = accel_range_g
+        self.gyro_range_dps: int = gyro_range_dps
+        self.gyro_unit: float = gyro_milli_degrees_per_unit / 1000   # °/s per raw unit
 
-    def get_tiltall(self):
-        """Returns (x, y, z) tilt in degrees via single block read, or None on error."""
-        try:
-            self._keepPortActive()
-            raw = self.bus.read_i2c_block_data(self.address, self.TILT_X, 3)
-            vals = struct.unpack("<3b", bytes(raw))
-            return tuple(math.degrees(math.asin(max(-1.0, min(1.0, v / 128.0)))) for v in vals)
-        except Exception:
-            return None
+    # ── Readings ───────────────────────────────────────────────────────────
 
-    def get_accelx(self):
-        try: return self._convert_acc([self.readIntegerSigned(self.ACCEL_X), 0, 0])[0]
-        except Exception: return None
+    def accel_all(self) -> Vector3:
+        """Acceleration in m/s²; at rest, the axis pointing down reads +9.8."""
+        return self._scaled_vector(self._read_vector(self.ACCEL), self.ACCEL_SCALE)
 
-    def get_accely(self):
-        try: return self._convert_acc([0, self.readIntegerSigned(self.ACCEL_Y), 0])[1]
-        except Exception: return None
+    def accel(self, axis: Axis) -> float:
+        return self._read_axis(self.ACCEL, axis) * self.ACCEL_SCALE
 
-    def get_accelz(self):
-        try: return self._convert_acc([0, 0, self.readIntegerSigned(self.ACCEL_Z)])[2]
-        except Exception: return None
+    def gyro_all(self) -> Vector3:
+        """Rotation rate in °/s."""
+        return self._scaled_vector(self._read_vector(self.GYRO), self.gyro_unit)
 
-    def get_accelall(self):
-        """Returns (x, y, z) accelerometer in m/s² via single block read, or None on error."""
-        try:
-            self._keepPortActive()
-            raw = self.bus.read_i2c_block_data(self.address, self.ACCEL_X, 6)
-            return tuple(self._convert_acc(struct.unpack("<3h", bytes(raw))))
-        except Exception:
-            return None
+    def gyro(self, axis: Axis) -> float:
+        return self._read_axis(self.GYRO, axis) * self.gyro_unit
 
-    def get_heading(self):
-        try:
-            for _ in range(5):
-                head = self.readInteger(self.CMPS)
-                if 0 <= head <= 360:
-                    return head
-            return None
-        except Exception:
-            return None
+    def mag_all(self) -> Vector3:
+        """Magnetic field in pseudo-nT (see MAG_SCALE)."""
+        return self._scaled_vector(self._read_vector(self.MAG), self.MAG_SCALE, self.MAG_SIGNS)
 
-    def get_magx(self):
-        try: return self._convert_mag([self.readIntegerSigned(self.MAG_X), 0, 0])[0]
-        except Exception: return None
+    def mag(self, axis: Axis) -> float:
+        sign = self.MAG_SIGNS[AXES.index(axis)]
+        return self._read_axis(self.MAG, axis) * self.MAG_SCALE * sign
 
-    def get_magy(self):
-        try: return self._convert_mag([0, self.readIntegerSigned(self.MAG_Y), 0])[1]
-        except Exception: return None
+    def acc_mag_gyr(self) -> tuple[Vector3, Vector3, Vector3]:
+        """accel_all(), mag_all() and gyro_all() in one 20-byte read
+        (5.4 ms instead of 3 × 2.2 ms): 0x45–0x58 holds accel (6 bytes),
+        compass heading (2), mag (6) and gyro (6)."""
+        raw = bytes(self.readArray(self.ACCEL, 20))
+        accel = self._scaled_vector(struct.unpack("<3h", raw[0:6]), self.ACCEL_SCALE)
+        mag = self._scaled_vector(struct.unpack("<3h", raw[8:14]), self.MAG_SCALE, self.MAG_SIGNS)
+        gyro = self._scaled_vector(struct.unpack("<3h", raw[14:20]), self.gyro_unit)
+        return accel, mag, gyro
 
-    def get_magz(self):
-        try: return self._convert_mag([0, 0, self.readIntegerSigned(self.MAG_Z)])[2]
-        except Exception: return None
+    def tilt_all(self) -> Vector3:
+        """Tilt of each axis in degrees, from the accelerometer:
+        asin(a_axis / |a|), 0 = axis level, +90 = axis pointing down.
+        Like any asin, 100° reads 80°: for a full-turn angle use atan2 on
+        accel_all(). Only meaningful at rest (shakes add acceleration)."""
+        accel = self.accel_all()
+        return Vector3(self._tilt_degrees(accel.x, accel), self._tilt_degrees(accel.y, accel),
+                       self._tilt_degrees(accel.z, accel))
 
-    def get_magall(self):
-        """Returns (x, y, z) magnetometer in nT via single block read, or None on error."""
-        try:
-            self._keepPortActive()
-            raw = self.bus.read_i2c_block_data(self.address, self.MAG_X, 6)
-            return tuple(self._convert_mag(struct.unpack("<3h", bytes(raw))))
-        except Exception:
-            return None
+    def tilt(self, axis: Axis) -> float:
+        """Tilt of one axis (reads the 3 accelerometer axes: |a| is needed)."""
+        accel = self.accel_all()
+        return self._tilt_degrees(accel[AXES.index(axis)], accel)
 
-    def get_gyrox(self):
-        try: return self._convert_gyro([self.readIntegerSigned(self.GYRO_X), 0, 0])[0]
-        except Exception: return None
+    def heading(self) -> int:
+        """Compass heading in degrees: 0 = the word "Compass" printed on the
+        sensor points north. Calibrate the compass on the robot first."""
+        heading = self.readInteger(self.HEADING)
+        if heading > 359:
+            raise OSError(f"AbsoluteIMU: compass heading out of range ({heading})")
+        return heading
 
-    def get_gyroy(self):
-        try: return self._convert_gyro([0, self.readIntegerSigned(self.GYRO_Y), 0])[1]
-        except Exception: return None
+    # ── Settings ───────────────────────────────────────────────────────────
 
-    def get_gyroz(self):
-        try: return self._convert_gyro([0, 0, self.readIntegerSigned(self.GYRO_Z)])[2]
-        except Exception: return None
-
-    def get_gyroall(self):
-        """Returns (x, y, z) gyroscope in deg/s via single block read, or None on error."""
-        try:
-            self._keepPortActive()
-            raw = self.bus.read_i2c_block_data(self.address, self.GYRO_X, 6)
-            return tuple(self._convert_gyro(struct.unpack("<3h", bytes(raw))))
-        except Exception:
-            return None
-
-    def start_cmpscal(self):
-        try: self.command(67)
-        except Exception: return None
-
-    def stop_cmpscal(self):
-        try: self.command(99)
-        except Exception: return None
-
-    def get_gyro_filter(self):
+    def gyro_filter(self) -> int:
+        """Current gyro filter order (see set_gyro_filter)."""
         return self.readByte(self.GYRO_FILTER)
 
-    def set_gyro_filter(self, value):
-        self.writeByte(self.GYRO_FILTER, value)
+    def set_gyro_filter(self, order: int) -> None:
+        """FIR filter on the gyro: 0 = none (fast, noisy) … 7 = strongest
+        (less noise, readings ~10 ms slower). Factory value 4; the IMU keeps
+        the value from one program to the next."""
+        self.writeByte(self.GYRO_FILTER, order)
 
-    def accel_2G(self):
-        """Set accel 2G / gyro 250°/s. Datasheet requires 50ms settle time after command."""
-        try: self.command(49); self.gyro_unit = 8.75; time.sleep(0.05)
-        except Exception: return None
+    def begin_compass_calibration(self) -> None:
+        """Then turn the whole robot slowly around each axis, and call
+        end_compass_calibration() (stored in the IMU, kept at power-off)."""
+        self.command(ord('C'))
 
-    def accel_4G(self):
-        """Set accel 4G / gyro 500°/s. Datasheet requires 50ms settle time after command."""
-        try: self.command(50); self.gyro_unit = 17.5; time.sleep(0.05)
-        except Exception: return None
+    def end_compass_calibration(self) -> None:
+        self.command(ord('c'))
 
-    def accel_8G(self):
-        """Set accel 8G / gyro 2000°/s. Datasheet requires 50ms settle time after command."""
-        try: self.command(51); self.gyro_unit = 70; time.sleep(0.05)
-        except Exception: return None
+    # ── Raw reads and conversions ──────────────────────────────────────────
 
-    def accel_16G(self):
-        """Set accel 16G / gyro 2000°/s. Datasheet requires 50ms settle time after command."""
-        try: self.command(52); self.gyro_unit = 70; time.sleep(0.05)
-        except Exception: return None
+    def _read_vector(self, register: int) -> tuple[int, int, int]:
+        """Three signed 16-bit values (X, Y, Z) from register on: 6 bytes."""
+        return struct.unpack("<3h", bytes(self.readArray(register, 6)))
 
-    def get_tilt_angle(self, axis='x'):
-        """Tilt angle in degrees. Alias for get_tiltx/y/z()."""
-        return {'x': self.get_tiltx, 'y': self.get_tilty, 'z': self.get_tiltz}[axis]()
+    def _read_axis(self, register: int, axis: Axis) -> int:
+        """The signed 16-bit value of one axis: 2 bytes."""
+        return self.readIntegerSigned(register + 2 * AXES.index(axis))
 
-    def _convert_gyro(self, raw_gyro):
-        """Converts raw gyroscope values to deg/s using the current sensitivity setting."""
-        gyro = [0.0, 0.0, 0.0]
-        for i in range(3):
-            gyro[i] = (raw_gyro[i] / 1000.0) * self.gyro_unit
-        return gyro
+    def _scaled_vector(self, raw: tuple[int, int, int], scale: float,
+                       signs: Vector3 = NO_SIGN_CHANGE) -> Vector3:
+        x, y, z = raw
+        return Vector3(x * scale * signs.x, y * scale * signs.y, z * scale * signs.z)
 
-    def _convert_acc(self, raw_acc):
-        """Converts raw accelerometer values to m/s²."""
-        acc = [0.0, 0.0, 0.0]
-        for i in range(3):
-            acc[i] = raw_acc[i] / 1000.0 * 9.80665
-        return acc
-
-    def _convert_mag(self, raw_mag):
-        """Converts raw magnetometer values to nT."""
-        mag = [0.0, 0.0, 0.0]
-        mag[0] =  raw_mag[0] / 0.03432
-        mag[1] = -raw_mag[1] / 0.03432
-        mag[2] = -raw_mag[2] / 0.03432
-        return mag
+    @staticmethod
+    def _tilt_degrees(axis_accel: float, accel: Vector3) -> float:
+        norm = math.sqrt(accel.x ** 2 + accel.y ** 2 + accel.z ** 2)
+        if norm == 0:          # free fall: no gravity to measure the tilt with
+            return 0.0
+        return math.degrees(math.asin(max(-1.0, min(1.0, axis_accel / norm))))

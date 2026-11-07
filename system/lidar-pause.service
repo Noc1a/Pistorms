@@ -1,0 +1,13 @@
+[Unit]
+Description=Keep the RPLidar motor stopped while no program uses it
+# Started by udev (99-rplidar.rules) when the LiDAR appears, stopped when it disappears
+BindsTo=dev-rplidar.device
+After=dev-rplidar.device
+
+[Service]
+User=robot
+ExecStart=/home/robot/Projects/env/bin/python3 -u -m pistorms.scripts.lidar_pause
+Restart=on-failure
+RestartSec=2
+StandardOutput=journal
+StandardError=journal

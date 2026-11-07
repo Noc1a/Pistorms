@@ -1,0 +1,14 @@
+[Unit]
+Description=PiStorms Battery Monitor
+After=network.target
+
+[Service]
+ExecStart=/home/robot/Projects/env/bin/python3 -u -m pistorms.scripts.batteries_monitor
+Restart=always
+User=robot
+WorkingDirectory=/home/robot
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

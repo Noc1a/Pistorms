@@ -1,0 +1,15 @@
+#!/bin/sh
+# PiStorms power-off hook.
+# systemd-shutdown runs every executable in this folder at the very end of the
+# shutdown — filesystems already unmounted or read-only — with $1 = poweroff,
+# halt, reboot or kexec. Start the PiStorms board power-cut countdown only when
+# powering off: on a reboot the board would cut the power mid-reboot.
+case "$1" in
+    poweroff|halt) ;;
+    *) exit 0 ;;
+esac
+# -B: no .pyc writes (read-only filesystem at this stage)
+/home/robot/Projects/env/bin/python3 -B -c "
+from pistorms import PiStorms
+PiStorms(reset=False, screen=False).startBoardPowerOff()
+"
