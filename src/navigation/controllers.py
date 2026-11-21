@@ -27,12 +27,19 @@ class Controller(ABC):
     way while moving."""
 
     ACCELERATION = 200   # %/s, every speed change of the wheels (50 % → 0 in 0.25 s)
-    MIN_START = 18       # %: below, a wheel doesn't move (static friction)
 
     def __init__(self, state: RobotState, drive: DriveBase) -> None:
         self.state = state
         self.drive: DriveBase = drive
         self._sent_speeds: Optional[tuple[int, int]] = None
+        # Motor %: below, a wheel standing still may not start (static
+        # friction). Measured for this model by the motors calibration
+        # (robot_profile.json min_start_speed; it depends on the weight):
+        # the first model starts at 6–8 % on the floor, and keeps turning
+        # down to 4 %. (It was a fixed 18 %: every small correction then
+        # turned the robot at ~100 °/s, and the Follow mode turned past the
+        # person, 2026-11-21.)
+        self.min_start: int = drive.profile.min_start_speed
 
     @abstractmethod
     def step(self):
@@ -49,7 +56,7 @@ class Controller(ABC):
         """Ramp both wheels to these speeds (−100…100, positive =
         forward). The ramp runs in the background: it is sent only when the
         speeds change. (0, 0) ramps down, then brakes (stops a spin).
-        A wheel asked to turn gets at least min_speed (default MIN_START,
+        A wheel asked to turn gets at least min_speed (default min_start,
         what starts it; less is enough for a wheel already turning).
 
         Collision guard, checked at every call: driving towards an obstacle
@@ -58,7 +65,7 @@ class Controller(ABC):
         stops a motion towards the obstacle, the wheels brake at once."""
         left, right, blocked = self._guarded(left, right)
         if min_speed is None:
-            min_speed = self.MIN_START
+            min_speed = self.min_start
         speeds = (round(self._apply_min_speed(left, min_speed)),
                   round(self._apply_min_speed(right, min_speed)))
         was_driving_into_it = blocked is not None and blocked != self.state.blocked
@@ -114,6 +121,49 @@ class Controller(ABC):
             clearance = self.state.front_clearance_m if blocked == 'front' else self.state.rear_clearance_m
             print(f"Collision guard: obstacle {clearance * 100:.0f} cm {blocked} — stopped", flush=True)
         self.state.blocked = blocked
+
+    # ── turning in place towards a heading (Follow, Navigate, Go Home) ──
+    HEADING_TOLERANCE  = math.radians(3)
+    TURN_SPEED         = 22          # motor %, ~120 °/s
+    # Turning in place: TURN_SPEED (~120 °/s) went 20–50° past the heading
+    # and swung back and forth (live_20261107_220647, final turn). Slower
+    # over the last TURN_SLOW_DEG, and stopped TURN_COAST_DEG early: the
+    # robot keeps turning while the brake ramps down and the gyro reports
+    # ~35 ms late (testSlam.MovingRobot.turn, same values: half turns of
+    # 176–179°)
+    TURN_SLOW_SPEED    = 10          # motor %, enough for wheels already turning
+    TURN_SLOW_DEG      = 20
+    TURN_COAST_DEG     = 8
+    HEADING_KP         = 25.0        # driving: turn part of the wheel speeds per rad of heading error
+
+    def _turning_direction(self) -> int:
+        """+1 turning in place to the left, −1 to the right, 0 otherwise
+        (from the speeds last sent to the wheels)."""
+        if self._sent_speeds is None:
+            return 0
+        left, right = self._sent_speeds
+        if left == -right != 0:
+            return 1 if right > 0 else -1
+        return 0
+
+    def _turned_to(self, err: float) -> bool:
+        """True once a heading error err (rad, > 0 = to the left) is done
+        with: within TURN_COAST_DEG while turning towards it (the robot
+        coasts the rest), else within HEADING_TOLERANCE."""
+        if self._turning_direction() * err > 0:
+            return abs(err) <= math.radians(self.TURN_COAST_DEG)
+        return abs(err) <= self.HEADING_TOLERANCE
+
+    def _turn_toward(self, err: float) -> None:
+        """Turn in place towards err: TURN_SPEED, then TURN_SLOW_SPEED over
+        the last TURN_SLOW_DEG once the wheels turn that way (from standstill
+        they need min_start)."""
+        direction = 1 if err > 0 else -1
+        speed = self.TURN_SPEED
+        if abs(err) <= math.radians(self.TURN_SLOW_DEG) and self._turning_direction() == direction:
+            speed = self.TURN_SLOW_SPEED
+        s = direction * speed
+        self._drive(-s, s, min_speed=self.TURN_SLOW_SPEED)   # s > 0: left backward, right forward → CCW (left)
 
     # ── shared helpers ──
     @staticmethod
@@ -212,8 +262,17 @@ class ManualController(Controller):
 
 # ════════════════════════════════════════════════════════════════════════════
 class FollowObjectController(Controller):
-    """Follow the detection of class state.follow_target.
-    If target lost > LOSS_TIMEOUT seconds, rotate slowly to search."""
+    """Follow the detection of class state.follow_target: proportional
+    control on its place in the image (turn) and on its distance (forward),
+    as in June, when it followed well.
+    If target lost > LOSS_TIMEOUT seconds, rotate slowly to search.
+
+    The wheels get at least MIN_SPEED, as in June: far below what starts a
+    wheel (6–8 % on the first model), so a small correction (under ~30 px)
+    doesn't move the robot. That is what kept it steady: raised to the
+    start speed (18 % since 7 November, then 10 %), every small correction
+    turned the robot, it turned past the person because the camera is late,
+    and swung from side to side (2026-11-21)."""
 
     LOSS_TIMEOUT   = 1.5      # s
     SEARCH_TURN    = 12       # motor units while searching
@@ -228,14 +287,21 @@ class FollowObjectController(Controller):
     MAX_STEP_TURN  = 6
     DEAD_ZONE_X    = 5
     DEAD_ZONE_DIST = 5
+    STATUS_PERIOD_SECS = 1.0  # one status line in the terminal per this
 
     def __init__(self, state: RobotState, drive: DriveBase) -> None:
         super().__init__(state, drive)
         self._cur_base = 0.0
         self._cur_turn = 0.0
         self._moving   = False
+        self._last_status_time: float = -math.inf
 
     def step(self):
+        action = self._follow()
+        self._print_status(action)
+
+    def _follow(self) -> str:
+        """One step of following; returns what the robot does (for the status line)."""
         tgt = self.state.targetPose
         ts  = tgt.pose_timestamp
         target_visible = ts is not None and (time.monotonic() - ts) < self.LOSS_TIMEOUT
@@ -248,7 +314,7 @@ class FollowObjectController(Controller):
             right = self._cur_base - self._cur_turn
             self._drive(left, right)
             self._moving = True
-            return
+            return 'searching'
 
         x_error = tgt.x
         if self.state.frontObstacleDistance is not None:
@@ -269,8 +335,9 @@ class FollowObjectController(Controller):
             left, right = self._scale_motors(left, right, self.MAX_MOTOR)
             left  = self._apply_min_speed(left,  self.MIN_SPEED)
             right = self._apply_min_speed(right, self.MIN_SPEED)
-            self._drive(left, right)
+            self._drive(left, right, min_speed=self.MIN_SPEED)
             self._moving = True
+            return 'following'
         elif self._moving:
             self._cur_base = self._ramp(self._cur_base, 0.0, self.MAX_STEP_DEC)
             self._cur_turn = self._ramp(self._cur_turn, 0.0, self.MAX_STEP_DEC)
@@ -281,7 +348,30 @@ class FollowObjectController(Controller):
                 self._cur_base = self._cur_turn = 0.0
                 self._moving = False
             else:
-                self._drive(left, right)
+                self._drive(left, right, min_speed=self.MIN_SPEED)
+            return 'slowing down'
+        return 'standing'
+
+    def _print_status(self, action: str) -> None:
+        """Once per STATUS_PERIOD_SECS, one line in the terminal: is the
+        target seen, the detections of its kind (score @ place in the image,
+        + = right, * = the followed one), its distance, what the robot does."""
+        now = time.monotonic()
+        if now - self._last_status_time < self.STATUS_PERIOD_SECS:
+            return
+        self._last_status_time = now
+        target_time = self.state.targetPose.pose_timestamp
+        seen = "never seen" if target_time is None else f"seen {now - target_time:4.1f} s ago"
+        same_kind = [detection for detection in self.state.last_detections
+                     if detection['label'] == self.state.follow_target]
+        detections = ", ".join(
+            f"{detection['score']:.2f}@{detection['x'] + detection['w'] / 2 - 160:+.0f}px"
+            + ("*" if detection.get('followed') else "")
+            for detection in same_kind) or "none"
+        distance = "--" if self.state.targetDistance is None else f"{self.state.targetDistance / 1000:.2f} m"
+        wheels = "--" if self._sent_speeds is None else f"L{self._sent_speeds[0]:+d} R{self._sent_speeds[1]:+d}"
+        print(f"[FOLLOW] {seen} | {self.state.follow_target}: {detections} | target x {self.state.targetPose.x:+d}px,"
+              f" {distance} | {action}, wheels {wheels}", flush=True)
 
     def stop(self):
         self._cur_base = self._cur_turn = 0.0
@@ -313,22 +403,10 @@ class NavigateController(Controller):
     PHASE_DRIVE      = 'drive'
     PHASE_FINAL_TURN = 'final_turn'
 
-    HEADING_TOLERANCE  = math.radians(3)
-    # Turning in place: TURN_SPEED (~120 °/s) went 20–50° past the heading
-    # and swung back and forth (live_20261107_220647, final turn). Slower
-    # over the last TURN_SLOW_DEG, and stopped TURN_COAST_DEG early: the
-    # robot keeps turning while the brake ramps down and the gyro reports
-    # ~35 ms late (testSlam.MovingRobot.turn, same values: half turns of
-    # 176–179°)
-    TURN_SLOW_SPEED    = 10          # motor %, enough for wheels already turning
-    TURN_SLOW_DEG      = 20
-    TURN_COAST_DEG     = 8
     TURN_IN_PLACE_DEG  = 30          # a waypoint farther off than this: turn in place first
     ARRIVAL_TOLERANCE  = 0.10        # m
-    SLOW_DOWN_M        = 0.30        # slower over the last of the way (down to MIN_START)
+    SLOW_DOWN_M        = 0.30        # slower over the last of the way (down to min_start)
     DRIVE_SPEED        = 25
-    TURN_SPEED         = 22
-    HEADING_KP         = 25.0        # P-gain for heading correction in DRIVE
 
     def __init__(self, state: RobotState, drive: DriveBase) -> None:
         super().__init__(state, drive)
@@ -438,7 +516,7 @@ class NavigateController(Controller):
     def _step_drive(self, err: float, distance_to_goal: float) -> None:
         speed = self.DRIVE_SPEED
         if distance_to_goal < self.SLOW_DOWN_M:
-            speed = max(self.MIN_START, self.DRIVE_SPEED * distance_to_goal / self.SLOW_DOWN_M)
+            speed = max(self.min_start, self.DRIVE_SPEED * distance_to_goal / self.SLOW_DOWN_M)
         correction = max(-speed, min(speed, self.HEADING_KP * err))
         left  = speed - correction           # err > 0 → right wheel faster → turn left
         right = speed + correction
@@ -451,36 +529,6 @@ class NavigateController(Controller):
             return
         self.state.nav_status = 'turning'
         self._turn_toward(err)
-
-    # ── helpers ──
-    def _turning_direction(self) -> int:
-        """+1 turning in place to the left, −1 to the right, 0 otherwise
-        (from the speeds last sent to the wheels)."""
-        if self._sent_speeds is None:
-            return 0
-        left, right = self._sent_speeds
-        if left == -right != 0:
-            return 1 if right > 0 else -1
-        return 0
-
-    def _turned_to(self, err: float) -> bool:
-        """True once a heading error err (rad, > 0 = to the left) is done
-        with: within TURN_COAST_DEG while turning towards it (the robot
-        coasts the rest), else within HEADING_TOLERANCE."""
-        if self._turning_direction() * err > 0:
-            return abs(err) <= math.radians(self.TURN_COAST_DEG)
-        return abs(err) <= self.HEADING_TOLERANCE
-
-    def _turn_toward(self, err: float) -> None:
-        """Turn in place towards err: TURN_SPEED, then TURN_SLOW_SPEED over
-        the last TURN_SLOW_DEG once the wheels turn that way (from standstill
-        they need MIN_START)."""
-        direction = 1 if err > 0 else -1
-        speed = self.TURN_SPEED
-        if abs(err) <= math.radians(self.TURN_SLOW_DEG) and self._turning_direction() == direction:
-            speed = self.TURN_SLOW_SPEED
-        s = direction * speed
-        self._drive(-s, s, min_speed=self.TURN_SLOW_SPEED)   # s > 0: left backward, right forward → CCW (left)
 
     def stop(self):
         """Mode change, arrival: ramp down, then brake; forget the goal."""

@@ -272,9 +272,24 @@ class Odometry(Sensor):
 
 
 class Camera(Sensor):
+    """The IMX500 AI camera: detects objects (SSD MobileNetV2, on the camera
+    itself), and publishes where the followed one is (state.targetPose) and
+    every detection (state.last_detections, for web_viz).
+
+    Which one is followed, when several of the follow_target kind are seen
+    (2026-11-21: the user and a chair taken for a person): the same one as
+    before — the one whose heading is nearest to the followed one's —
+    instead of the surest of each frame, which swung the robot between the
+    two. Headings, not places in the image: when the robot turns, the whole
+    image moves (a place in the image lost the person in every turn). A new
+    target is chosen only when the followed one is lost."""
+
     CAM_WIDTH  = 320
     CAM_HEIGHT = 320
     HFOV       = 78.0  # Approx horizontal field of view of the AI module
+    DETECTION_SCORE     = 0.5    # a detection less sure than this is ignored
+    TARGET_LOST_SECS    = 1.5    # unseen this long, the followed one is given up (as FollowObjectController.LOSS_TIMEOUT)
+    MAX_TARGET_JUMP_DEG = 20     # between two detections, the followed one's heading changes less than this
 
     def __init__(self, state: RobotState):
         super().__init__(state)
@@ -293,6 +308,53 @@ class Camera(Sensor):
             buffer_count=12,
         )
         self.picam2.configure(config)
+        self._forget_target()
+
+    def _forget_target(self) -> None:
+        self._followed_heading: Optional[float] = None   # rad, same frame as state.pose
+        self._followed_time: float = -math.inf           # time.monotonic() last seen
+        self._followed_label: Optional[str] = None
+
+    @classmethod
+    def _deviation_deg(cls, detection: dict) -> float:
+        """Angle of the detection's centre from the image's centre (° , > 0 = right)."""
+        offset_px = detection['x'] + detection['w'] / 2 - cls.CAM_WIDTH / 2
+        return offset_px / (cls.CAM_WIDTH / 2) * (cls.HFOV / 2)
+
+    @classmethod
+    def _heading_of(cls, detection: dict, robot_heading: float) -> float:
+        """Heading of the detection (rad, counter-clockwise like state.pose):
+        the robot's heading minus its angle in the image (> 0 = to the right
+        = clockwise)."""
+        return robot_heading - math.radians(cls._deviation_deg(detection))
+
+    def _choose_target(self, candidates: list[dict], now: float, robot_heading: float) -> Optional[dict]:
+        """The detection to follow among the candidates (all of the
+        follow_target kind), or None this frame.
+        - While following one (seen less than TARGET_LOST_SECS ago): the
+          candidate whose heading is nearest to the followed one's, if within
+          MAX_TARGET_JUMP_DEG; else none (the followed one is hidden this
+          frame, not replaced).
+        - Otherwise: the surest candidate."""
+        if self._followed_label != self.state.follow_target:
+            self._forget_target()               # following another kind now
+        if not candidates:
+            return None
+        following = self._followed_heading is not None and now - self._followed_time < self.TARGET_LOST_SECS
+        if following:
+            def angle_to_followed(detection: dict) -> float:
+                gap = self._heading_of(detection, robot_heading) - self._followed_heading
+                return abs(math.atan2(math.sin(gap), math.cos(gap)))
+
+            chosen = min(candidates, key=angle_to_followed)
+            if angle_to_followed(chosen) > math.radians(self.MAX_TARGET_JUMP_DEG):
+                return None
+        else:
+            chosen = max(candidates, key=lambda detection: detection['score'])
+        self._followed_heading = self._heading_of(chosen, robot_heading)
+        self._followed_time = now
+        self._followed_label = self.state.follow_target
+        return chosen
 
     # JPEG-encode preview frames only while a web viewer has asked for one
     # recently — encoding every frame costs CPU the control loop needs.
@@ -342,23 +404,28 @@ class Camera(Sensor):
         boxes, scores, classes = outputs[0][0], outputs[1][0], outputs[2][0]
 
         detections = []
-        best = None   # highest-scoring detection of the follow target
         for i in range(len(scores)):
-            if scores[i] > 0.5:
+            if scores[i] > self.DETECTION_SCORE:
                 box = boxes[i]
                 x, y, w, h = self.imx500.convert_inference_coords(box, metadata, self.picam2)
                 label = labels[int(classes[i])] if labels else str(int(classes[i]))
                 det = {
                     'x': int(x), 'y': int(y), 'w': int(w), 'h': int(h),
                     'label': label, 'score': float(scores[i]),
+                    'followed': False,
                 }
                 detections.append(det)
-                if label == self.state.follow_target and (best is None or det['score'] > best['score']):
-                    best = det
+
+        candidates = [det for det in detections if det['label'] == self.state.follow_target]
+        with self.state._pose_lock:
+            robot_heading = self.state.pose.angle_rad
+        best = self._choose_target(candidates, time.monotonic(), robot_heading)
 
         if best is not None:
+            best['followed'] = True             # web_viz draws it apart
             target_x = int(best['x'] + (best['w'] // 2) - Camera.CAM_WIDTH // 2)
-            deviation_deg = target_x / (Camera.CAM_WIDTH / 2) * (Camera.HFOV / 2)
+            deviation_deg = self._deviation_deg(best)
+            self.state.target_heading_rad = self._heading_of(best, robot_heading)
             # Publish a NEW Pose in one assignment so readers never see the new
             # timestamp paired with the old x/angle.
             self.state.targetPose = Pose(target_x, 0, math.radians(deviation_deg),
@@ -385,6 +452,18 @@ class Lidar(Sensor):
             raise ValueError("the robot profile has no LiDAR (no lidar_port)")
         self.portName: str = portName
         self.yaw_deg: float = profile.lidar_yaw_deg
+
+    def _target_angle_cw_deg(self) -> float:
+        """Where the followed target is now, clockwise from robot forward
+        (the scans' angles): from its heading (state.target_heading_rad)
+        and the robot's heading now, so that it stays right while the robot
+        turns between two detections."""
+        target_heading = self.state.target_heading_rad
+        if target_heading is None:
+            return self.state.targetPose.get_angle_deg() % 360
+        with self.state._pose_lock:
+            robot_heading = self.state.pose.angle_rad
+        return math.degrees(robot_heading - target_heading) % 360
 
     def _hand_to_slam(self, scan_time: float, scan: list, serial_bytes_waiting: int) -> None:
         """Queue the scan for the Slam thread, never blocking: if the queue
@@ -418,7 +497,7 @@ class Lidar(Sensor):
 
                 min_target_distance = float('inf')
                 min_front_distance  = float('inf')
-                lidar_target_angle  = self.state.targetPose.get_angle_deg() % 360
+                lidar_target_angle  = self._target_angle_cw_deg()
 
                 for (quality, angle, distance) in scan:
                     if quality == 0 or distance <= 0:

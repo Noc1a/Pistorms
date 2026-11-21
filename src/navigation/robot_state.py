@@ -41,6 +41,12 @@ class RobotState:
         self.wheel_heading_rad: float = 0.0
         self.gyro_heading_rad: float = 0.0
         self.targetPose = Pose(0, 0, 0.0)
+        # Heading of the followed target (rad, same frame as pose.angle_rad),
+        # worked out by the Camera thread at each detection: the robot's
+        # heading then, plus the target's angle in the image. Between two
+        # detections, the Follow mode turns towards it with the odometry's
+        # heading, which knows how far the robot has turned meanwhile.
+        self.target_heading_rad: Optional[float] = None
         self.frontObstacleDistance = None
         # Collision guard (navigation.collision): free room in the robot's
         # corridor, written by the Lidar thread at each scan
