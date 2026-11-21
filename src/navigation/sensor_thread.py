@@ -14,9 +14,11 @@ import numpy as np
 from PIL import Image as _PILImage
 from picamera2 import Picamera2
 from picamera2.devices import IMX500
-from pistorms import PiStorms, PiStormsMotor
+from pistorms import PiStorms
 from pistorms.devices import AbsoluteIMU, EV3InfraredSensor
 from . import collision, lidar_reader, pose_correction
+from .drive_base import DriveBase
+from .robot_profile import TICKS_PER_REV, load_profile
 from .robot_state import Pose, RobotState
 from .slam import ODOMETRY_LAG_SECS, LidarSlam
 
@@ -87,33 +89,35 @@ class Odometry(Sensor):
     # the odometry uses this value. The lag is compensated by the SLAM
     # (navigation/slam.py, ODOMETRY_LAG_SECS).
     GYRO_FILTER = 4
-    TICKS_PER_REV = 360.0
     GYRO_CAL_SAMPLES = 300
     SPEED_SMOOTHING = 0.2      # state.speed_mps: share of each new sample (~0.1 s at 50 Hz)
     LIDAR_WAIT_SECS = 15.0     # longest wait for the LiDAR to turn before the bias calibration
     LIDAR_SETTLE_SECS = 1.0    # then let its vibration settle
 
-    # Sign conventions (measured in tests/testOdometryAccuracy.py):
-    # setSpeed(-N) drives forward, and encoders count in the commanded
-    # direction, so forward motion DECREASES both tick counts.
-    LEFT_TICK_SIGN  = -1
-    RIGHT_TICK_SIGN = -1
-    # The AbsoluteIMU's Z axis points down on this robot: a CCW turn reads
-    # negative gyro Z.
-    GYRO_Z_SIGN     = -1
+    # Sign conventions come from the robot profile: the wheels' ticks are
+    # forward-positive through DriveBase, and the gyro axis that points up
+    # (imu_up_axis, else Z with gyro_z_sign) gives the turn rate.
+    # The gyro reads 0.36 % too little, both ways (2026-11-07, testSlam.py
+    # --spin --turns 5 at ±22 %, against the LiDAR truth: −8.1° over 1828°
+    # counter-clockwise, +4.9° over −1826° clockwise; the rest of the gap
+    # is a −0.10 °/s vibration bias)
+    GYRO_SCALE      = 1.0036
     # A larger tick change in one 20 ms sample is physically impossible
     # (I²C corruption or an encoder reset by another process) — skip it.
     MAX_TICK_DELTA  = 500
 
-    def __init__(self, state: RobotState, imu: AbsoluteIMU,
-                 motorLeft: PiStormsMotor, motorRight: PiStormsMotor,
-                 wheel_diameter: float, wheel_base: float):
+    def __init__(self, state: RobotState, imu: AbsoluteIMU, drive: DriveBase):
         super().__init__(state)
         self.imu = imu
-        self.motorLeft = motorLeft
-        self.motorRight = motorRight
-        self.wheel_circumference = math.pi * wheel_diameter
-        self.wheel_base = wheel_base
+        self.drive: DriveBase = drive
+        profile = drive.profile
+        self.wheel_circumference: float = profile.wheel_circumference
+        self.wheel_base: float = profile.wheel_base
+        # The gyro axis that points up, and its sign for a counter-clockwise
+        # turn: measured by tests/calibrateSensors.py, else Z
+        up_axis = profile.imu_up_axis or ('+z' if profile.gyro_z_sign > 0 else '-z')
+        self._gyro_axis: str = up_axis[1]
+        self._gyro_sign: int = 1 if up_axis[0] == '+' else -1
         self._gyro_bias_z_rad = 0.0
         # SLAM correction applied to state.pose, easing towards
         # state.odom_correction_target (navigation.pose_correction)
@@ -129,7 +133,7 @@ class Odometry(Sensor):
         for _ in range(self.GYRO_CAL_SAMPLES):
             gyr_z = self._read_gyro_z()
             if gyr_z is not None:
-                samples.append(gyr_z * self.GYRO_Z_SIGN)
+                samples.append(gyr_z * self._gyro_sign)
             time.sleep(0.005)
         if not samples:
             print("Gyro bias calibration got no samples — assuming 0 deg/s")
@@ -150,10 +154,11 @@ class Odometry(Sensor):
         return 1 - self.ALPHA
 
     def _read_gyro_z(self) -> Optional[float]:
-        """Raw gyro Z in deg/s, or None on I²C error: that sample then uses
+        """Raw gyro reading of the vertical axis (Z unless the IMU is mounted
+        on its side) in deg/s, or None on I²C error: that sample then uses
         the wheels only."""
         try:
-            return self.imu.gyro('z')
+            return self.imu.gyro(self._gyro_axis)
         except OSError as e:
             print(f"Odometry: gyro read failed ({e!r}) — wheels only for this sample")
             return None
@@ -161,8 +166,7 @@ class Odometry(Sensor):
     def _read_ticks(self):
         """Both encoders as forward-positive tick counts, or None on I²C error."""
         try:
-            return (self.motorLeft.pos()  * self.LEFT_TICK_SIGN,
-                    self.motorRight.pos() * self.RIGHT_TICK_SIGN)
+            return self.drive.ticks()
         except (OSError, TypeError) as e:
             print(f"Odometry: encoder read failed ({e!r}) — skipping sample")
             return None
@@ -171,8 +175,8 @@ class Odometry(Sensor):
         """Advance the pose by one sample. d_left/d_right are forward-positive
         tick deltas; gyr_z is the RAW gyro Z in deg/s (or None)."""
         # encoder deltas → forward-signed wheel travel (m)
-        dl = d_left  * self.wheel_circumference / self.TICKS_PER_REV
-        dr = d_right * self.wheel_circumference / self.TICKS_PER_REV
+        dl = d_left  * self.wheel_circumference / TICKS_PER_REV
+        dr = d_right * self.wheel_circumference / TICKS_PER_REV
 
         # heading: complementary filter on rotation increments; without
         # a gyro sample, fall back to wheels only for this step
@@ -182,8 +186,8 @@ class Odometry(Sensor):
             d_theta = d_theta_odom
             d_theta_gyro = d_theta_odom
         else:
-            d_theta_gyro = (math.radians(gyr_z * self.GYRO_Z_SIGN)
-                            - self._gyro_bias_z_rad) * dt
+            d_theta_gyro = (math.radians(gyr_z * self._gyro_sign)
+                            - self._gyro_bias_z_rad) * self.GYRO_SCALE * dt
             wheel_weight = self._wheel_weight(distance, d_theta_gyro, dt)
             d_theta = (1 - wheel_weight) * d_theta_gyro + wheel_weight * d_theta_odom
         # Each source alone, for the comparison with the SLAM (recordings
@@ -367,9 +371,18 @@ class Lidar(Sensor):
     distances, keeps it for web_viz (state.last_scan) and hands it to the
     Slam thread."""
 
-    def __init__(self, state: RobotState, portName: str = '/dev/ttyUSB0'):
+    def __init__(self, state: RobotState, portName: Optional[str] = None):
+        """portName: the LiDAR's serial port; by default the robot profile's
+        lidar_port. The profile's lidar_yaw_deg (which way the LiDAR is
+        mounted) is removed from every scan by the reader."""
         super().__init__(state)
-        self.portName = portName
+        profile = load_profile()
+        if portName is None:
+            portName = profile.lidar_port
+        if portName is None:
+            raise ValueError("the robot profile has no LiDAR (no lidar_port)")
+        self.portName: str = portName
+        self.yaw_deg: float = profile.lidar_yaw_deg
 
     def _hand_to_slam(self, scan_time: float, scan: list, serial_bytes_waiting: int) -> None:
         """Queue the scan for the Slam thread, never blocking: if the queue
@@ -390,7 +403,7 @@ class Lidar(Sensor):
         context = multiprocessing.get_context('spawn')
         scans = context.Queue(maxsize=lidar_reader.SCANS_QUEUE_SIZE)
         stop = context.Event()
-        reader = context.Process(target=lidar_reader.read_lidar, args=(self.portName, scans, stop),
+        reader = context.Process(target=lidar_reader.read_lidar, args=(self.portName, scans, stop, self.yaw_deg),
                                  name='lidar_reader', daemon=True)
         reader.start()
         try:

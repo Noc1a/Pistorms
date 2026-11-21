@@ -3,13 +3,9 @@ import time
 import threading
 import numpy as np
 
-from pistorms import PiStormsMotor
+from .drive_base import DriveBase
 from .robot_state import RobotState
 
-WHEEL_BASE        = 0.17
-WHEEL_DIAMETER    = 0.0942
-WHEEL_CIRCUMFERENCE = math.pi * WHEEL_DIAMETER
-TICKS_PER_REV     = 360.0
 ARRIVAL_TOLERANCE = 0.05        # 5cm
 HEADING_TOLERANCE = math.radians(2)  # 2°
 MIN_DRIVE_SPEED   = 18          # motor deadband — below this the wheels stall
@@ -18,10 +14,11 @@ MAX_TURN_ATTEMPTS = 10
 DRIVE_TIMEOUT     = 30.0        # s
 
 class Driver:
-    def __init__(self, state: RobotState, motorLeft: PiStormsMotor, motorRight: PiStormsMotor):
-        self.state      = state
-        self.motorLeft  = motorLeft
-        self.motorRight = motorRight
+    def __init__(self, state: RobotState, drive: DriveBase):
+        """drive: the robot's wheels (ports, directions and sizes from the
+        robot profile)."""
+        self.state = state
+        self.drive: DriveBase = drive
 
     # ------------------------------------------------------------------ #
     #  Public API                                                          #
@@ -46,8 +43,8 @@ class Driver:
             t.start()
 
     def stop(self):
-        self.motorLeft.brake()
-        self.motorRight.brake()
+        # at once: _drive_to_target has already slowed down (_ramp_speed)
+        self.drive.brake(acceleration=None)
 
     # ------------------------------------------------------------------ #
     #  Internal implementation                                            #
@@ -82,23 +79,29 @@ class Driver:
                 return
 
             # pivot turn: each wheel travels half the wheel base times the angle
-            arc_length  = (WHEEL_BASE / 2.0) * abs(angle_error)
-            motor_degs  = int(round((arc_length / WHEEL_CIRCUMFERENCE) * 360.0))
+            profile = self.drive.profile
+            arc_length  = (profile.wheel_base / 2.0) * abs(angle_error)
+            motor_degs  = int(round((arc_length / profile.wheel_circumference) * 360.0))
             if motor_degs == 0:
                 return
 
-            # pose angle is CCW-positive and setSpeed(+N) drives a wheel backward:
-            # s > 0 → left backward, right forward → turn left (CCW).
-            # Degrees carry the same sign as the speed so the move direction is
-            # unambiguous whichever of the two the firmware reads it from.
-            s = TURN_SPEED if angle_error > 0 else -TURN_SPEED
-            self.motorLeft.runDegs(math.copysign(motor_degs,  s),  s, True, False)
-            self.motorRight.runDegs(math.copysign(motor_degs, -s), -s, True, False)
+            # pose angle is CCW-positive: to turn left, the left wheel rolls
+            # backward and the right one forward. The motor speed of each
+            # wheel carries the profile's forward sign; the degrees carry the
+            # same sign as the speed so the move direction is unambiguous
+            # whichever of the two the firmware reads it from.
+            direction = 1 if angle_error > 0 else -1
+            left_motor_speed  = -direction * TURN_SPEED * self.drive.left_sign
+            right_motor_speed =  direction * TURN_SPEED * self.drive.right_sign
+            self.drive.left.runDegs(math.copysign(motor_degs, left_motor_speed),
+                                    left_motor_speed, True, False)
+            self.drive.right.runDegs(math.copysign(motor_degs, right_motor_speed),
+                                     right_motor_speed, True, False)
 
             # runDegs only writes the setpoint — wait for both moves to finish
             # so the next iteration sees the post-turn pose
-            self.motorLeft.waitUntilNotBusy(TURN_MOVE_TIMEOUT)
-            self.motorRight.waitUntilNotBusy(TURN_MOVE_TIMEOUT)
+            self.drive.left.waitUntilNotBusy(TURN_MOVE_TIMEOUT)
+            self.drive.right.waitUntilNotBusy(TURN_MOVE_TIMEOUT)
 
             time.sleep(0.02)  # let IMU update
         print(f"Driver: heading not reached after {MAX_TURN_ATTEMPTS} turn attempts")
@@ -157,17 +160,18 @@ class Driver:
                                           accel_time, max_speed)
 
    
-            # negative = forward on this robot's motor wiring; heading_error > 0
+            # wheel speeds, positive = forward; heading_error > 0
             # (CCW-positive) → right wheel faster → turn left
-            left_speed  = -(base_speed - correction)
-            right_speed = -(base_speed + correction)
+            left_speed  = base_speed - correction
+            right_speed = base_speed + correction
 
             # clamp to valid range
             left_speed  = max(-100, min(100, left_speed))
             right_speed = max(-100, min(100, right_speed))
 
-            self.motorLeft.setSpeed(int(left_speed),  blocking=False)
-            self.motorRight.setSpeed(int(right_speed), blocking=False)
+            # no motor ramp: base_speed is already ramped (_ramp_speed), and
+            # this loop sends a new speed every 20 ms
+            self.drive.drive(int(left_speed), int(right_speed), acceleration=None, blocking=False)
 
             time.sleep(0.02)
 

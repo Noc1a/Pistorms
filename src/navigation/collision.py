@@ -1,16 +1,20 @@
 """Collision guard: how much free room the robot has in front of its nose
 and behind its back, in a corridor as wide as the robot.
 
-The robot's shape, measured from the LiDAR's centre (2026-11-07): nose
-11 cm ahead, back 25 cm behind, 19 cm wide. Controller._drive() uses
-clearances() and stop_distance() to stop driving into an obstacle, in every
-mode. No hardware here: unit-tested on its own.
+The robot's shape and the LiDAR's place on it come from the robot profile
+(robot_profile.json: body_front, body_rear, body_width, lidar_dx, lidar_dy).
+Controller._drive() uses clearances() and stop_distance() to stop driving
+into an obstacle, in every mode. No hardware here: unit-tested on its own.
 """
 import math
 
-NOSE_M            = 0.11     # nose ahead of the LiDAR centre
-REAR_M            = 0.25     # back of the robot behind the LiDAR centre
-HALF_WIDTH_M      = 0.095    # robot 19 cm wide
+from .robot_profile import load_profile
+
+_PROFILE          = load_profile()
+NOSE_M            = _PROFILE.body_front - _PROFILE.lidar_dx   # nose ahead of the LiDAR centre
+REAR_M            = _PROFILE.body_rear + _PROFILE.lidar_dx    # back of the robot behind the LiDAR centre
+HALF_WIDTH_M      = _PROFILE.body_width / 2
+LIDAR_DY          = _PROFILE.lidar_dy                         # LiDAR centre left of the robot's centre line
 SIDE_MARGIN_M     = 0.01     # corridor 1 cm wider than the robot on each side
 STOP_MARGIN_M     = 0.05     # free room kept in front of the nose / behind the back
 # Time between an obstacle showing up and the robot standing still: age of a
@@ -26,18 +30,20 @@ SPEED_MPS_PER_PERCENT = 0.008
 def clearances(scan: list) -> tuple[float, float]:
     """Free room (m) in front of the nose and behind the back, in the
     robot's corridor; math.inf when nothing is there.
-    scan: RPLidar points (quality, angle_deg clockwise, distance_mm). Points
-    inside the robot's own outline are the robot itself: ignored."""
+    scan: RPLidar points (quality, angle_deg clockwise from robot forward,
+    distance_mm), as the Lidar thread hands them out. Points inside the
+    robot's own outline are the robot itself: ignored."""
     corridor_half_width = HALF_WIDTH_M + SIDE_MARGIN_M
     front = math.inf
     rear = math.inf
     for quality, angle_cw, distance_mm in scan:
         if quality == 0 or distance_mm <= 0:
             continue
-        # LiDAR frame: x forward, y left (RPLidar angles are clockwise)
+        # x forward from the LiDAR centre, y left from the robot's centre
+        # line (RPLidar angles are clockwise)
         angle = math.radians(-angle_cw)
         x = distance_mm / 1000 * math.cos(angle)
-        y = distance_mm / 1000 * math.sin(angle)
+        y = distance_mm / 1000 * math.sin(angle) + LIDAR_DY
         if abs(y) > corridor_half_width:
             continue
         if x > NOSE_M:

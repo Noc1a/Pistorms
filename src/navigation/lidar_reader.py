@@ -10,6 +10,10 @@ up to 3.7 s. A process has its own interpreter: nothing else slows it.
 
 This module imports only rplidar: the process starts with 'spawn' (safe in
 a program that already runs threads) and must not load the camera.
+
+Scans leave this module robot-oriented: 0° = robot forward, whichever way
+the LiDAR is mounted (rotate_scan with the profile's lidar_yaw_deg). The
+SLAM, the collision guard and the person following all rely on it.
 """
 import multiprocessing
 import queue
@@ -20,11 +24,24 @@ SCANS_QUEUE_SIZE = 4
 MAX_BACKOFF_SECS = 15.0
 
 
-def read_lidar(port_name: str, scans: multiprocessing.Queue, stop: multiprocessing.Event) -> None:
+def rotate_scan(scan: list, yaw_deg: float) -> list:
+    """The scan with its angles counted from robot forward instead of from
+    the LiDAR's own 0°. yaw_deg: the LiDAR's 0° turned counter-clockwise
+    from robot forward (the profile's lidar_yaw_deg); RPLidar angles are
+    clockwise, so a point's angle from robot forward is angle − yaw."""
+    if yaw_deg == 0:
+        return scan
+    return [(quality, (angle_cw - yaw_deg) % 360.0, distance_mm)
+            for quality, angle_cw, distance_mm in scan]
+
+
+def read_lidar(port_name: str, scans: multiprocessing.Queue, stop: multiprocessing.Event,
+               yaw_deg: float = 0.0) -> None:
     """Process: read full scans until stop is set, and put each one in
     scans as (time.monotonic() at its end, [(quality, angle_deg_cw, mm), ...],
-    serial bytes still waiting). time.monotonic() is the same clock in every
-    process of the Pi."""
+    serial bytes still waiting), the angles counted from robot forward
+    (rotate_scan). time.monotonic() is the same clock in every process of
+    the Pi."""
     from rplidar import RPLidar
 
     lidar = RPLidar(port_name)
@@ -37,7 +54,9 @@ def read_lidar(port_name: str, scans: multiprocessing.Queue, stop: multiprocessi
                     backoff = 1.0
                     if stop.is_set():
                         break
-                    _put_dropping_oldest(scans, (time.monotonic(), scan, _bytes_waiting(lidar)))
+                    scan_time = time.monotonic()
+                    _put_dropping_oldest(scans, (scan_time, rotate_scan(scan, yaw_deg),
+                                                 _bytes_waiting(lidar)))
             except Exception as e:
                 if stop.is_set():
                     break

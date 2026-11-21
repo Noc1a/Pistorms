@@ -25,7 +25,7 @@ SAFE_VOLTAGES: dict[str, float] = {
     "LiPo": 7.0,   # volts for your LiPo pack
 }
 DEFAULT_BATTERY = "NiMH"
-WARNING_MARGIN = 0.4   # LEDs blink below safe voltage + this
+WARNING_MARGIN = 0.2   # LEDs blink below safe voltage + this
 
 # Last choice and the boot it was made at
 SETTINGS_PATH = os.path.expanduser("~/.config/pistorms/battery.json")

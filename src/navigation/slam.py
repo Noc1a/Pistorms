@@ -14,14 +14,17 @@ from typing import Optional
 
 import numpy as np
 
+from .robot_profile import load_profile
+
 OdomPose = tuple[float, float, float]      # x m, y m, θ rad
 
 # ── LiDAR mounting ─────────────────────────────────────────────────────────
-# Calibrated 2026-10-30 with tests/calibrateLidarOffset.py (in-place spin,
-# 13 stops, robot centre stable to ±0.2 cm; ruler measurement was 7.0 / −0.4).
-LIDAR_DX      = 0.078    # m, LiDAR rotation centre ahead of the drive-wheel axle
-LIDAR_DY      = 0.001    # m, LiDAR rotation centre to the LEFT of the robot centre
-LIDAR_YAW_DEG = 0.0      # deg, CCW rotation of LiDAR 0° vs robot forward
+# From the robot profile (robot_profile.json), measured by
+# tests/calibrateSensors.py. Which way the LiDAR points (lidar_yaw_deg) is
+# not needed here: the scans arrive robot-oriented (lidar_reader.rotate_scan).
+_PROFILE      = load_profile()
+LIDAR_DX      = _PROFILE.lidar_dx    # m, LiDAR rotation centre ahead of the drive-wheel axle
+LIDAR_DY      = _PROFILE.lidar_dy    # m, LiDAR rotation centre to the LEFT of the robot centre
 SCAN_MIN_M    = 0.15     # ignore returns closer than this (robot body, cables)
 
 # ── Scans given to BreezySLAM ──────────────────────────────────────────────
@@ -39,7 +42,10 @@ MAP_SIZE_METERS   = 10       # 1 cm per pixel, robot starts at the centre
 HOLE_WIDTH_MM     = 200      # wall thickness drawn behind each return (BreezySLAM default 600)
 # 0–255: how much each scan changes the map (BreezySLAM default 50). Low: a
 # scan matched slightly wrong (fast turn, a person walking by) barely marks
-# the map, and walls stay single; see SIGMA_XY_MM for the measurements
+# the map, and walls stay single; see SIGMA_XY_MM for the measurements.
+# Quality 10 was no better (2026-11-07, live_20261107_225333: consistency
+# 0.80 against 0.83): pale walls on the screen came from the resize
+# (LidarSlam._shrunk_keeping_walls)
 MAP_QUALITY       = 5
 # Pose search around the odometry. BreezySLAM's defaults (±100 mm, ±20°) are
 # made for a poor odometry; ours is good to ~1 cm, and the wide search only
@@ -222,7 +228,8 @@ class LidarSlam:
         # BreezySLAM's map: pixels[y][x], y up. The picture puts +x up and +y
         # on the left: picture row = N − x, column = N − y
         pixels = np.frombuffer(self.map_pixels(), dtype=np.uint8).reshape(MAP_SIZE_PIXELS, MAP_SIZE_PIXELS)
-        picture = Image.fromarray(np.ascontiguousarray(np.flip(pixels.T))).convert('RGB')
+        # (Gray until the resize: the wall filter is ~4× faster than in RGB)
+        picture = Image.fromarray(np.ascontiguousarray(np.flip(pixels.T)))
         with self._lock:
             trail = list(self.trail)
 
@@ -246,7 +253,7 @@ class LidarSlam:
         picture = self._crop_with_unknown(picture, round(left), round(top),
                                           round(crop_width), round(crop_height))
         scale = width / crop_width
-        picture = picture.resize((width, height))
+        picture = self._shrunk_keeping_walls(picture, (width, height)).convert('RGB')
 
         def on_picture(pose: OdomPose) -> tuple[float, float]:
             column, row = self._picture_pixel(pose)
@@ -262,11 +269,34 @@ class LidarSlam:
         return picture
 
     @staticmethod
+    def _shrunk_keeping_walls(picture, size: tuple[int, int]):
+        """Resize; when shrinking, each wall is first thickened to about one
+        pixel of the result (darkest of its neighbours), else the resize
+        averages the 1–2 cm walls into a pale gray (the 320 × 240 screen
+        shrinks ~3×). It also erases the thin free rays through windows.
+        (In NumPy: PIL's MinFilter took 200 ms on the Pi.)"""
+        from PIL import Image
+        shrink = picture.width / size[0]
+        if shrink > 1.5:
+            reach = round(shrink / 2)            # pixels each side
+            pixels = np.asarray(picture)
+            darkest = pixels.copy()
+            for shift in range(1, reach + 1):     # rows, then columns
+                np.minimum(darkest[shift:], pixels[:-shift], out=darkest[shift:])
+                np.minimum(darkest[:-shift], pixels[shift:], out=darkest[:-shift])
+            rows_done = darkest.copy()
+            for shift in range(1, reach + 1):
+                np.minimum(darkest[:, shift:], rows_done[:, :-shift], out=darkest[:, shift:])
+                np.minimum(darkest[:, :-shift], rows_done[:, shift:], out=darkest[:, :-shift])
+            picture = Image.fromarray(darkest)
+        return picture.resize(size)
+
+    @staticmethod
     def _crop_with_unknown(picture, left: int, top: int, width: int, height: int):
-        """Crop; where the crop goes past the map's edge, gray (unknown)
+        """Crop a gray picture; where the crop goes past the map's edge, gray (unknown)
         instead of the black PIL fills in."""
         from PIL import Image
-        cropped = Image.new('RGB', (width, height), (UNKNOWN_GRAY,) * 3)
+        cropped = Image.new('L', (width, height), UNKNOWN_GRAY)
         visible = (max(0, left), max(0, top), min(picture.width, left + width), min(picture.height, top + height))
         if visible[0] < visible[2] and visible[1] < visible[3]:
             cropped.paste(picture.crop(visible), (visible[0] - left, visible[1] - top))
