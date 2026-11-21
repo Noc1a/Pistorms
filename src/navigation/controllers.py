@@ -13,6 +13,7 @@ from typing import Optional
 
 from . import collision
 from .drive_base import DriveBase
+from .path_planner import PathPlanner
 from .robot_state import RobotState
 
 
@@ -289,22 +290,27 @@ class FollowObjectController(Controller):
 
 
 # ════════════════════════════════════════════════════════════════════════════
-class GoHomeController(Controller):
-    """Drive back to (0,0) using straight-line + reactive lidar avoidance.
+class NavigateController(Controller):
+    """Drive to state.nav_goal = (x, y, final heading or None) along the way
+    the PathPlanner finds on the SLAM map (navigation.path_planner): around
+    the walls, and around the obstacles of the latest LiDAR scan. The way is
+    planned again every REPLAN_SECS, and at once when the collision guard
+    stops the robot.
 
-    Uses Odometry's frame: angle CCW-positive, so a positive heading error
-    means "turn left" (right wheel faster) in every phase.
+    Uses Odometry's frame (corrected by the SLAM): angle CCW-positive, so a
+    positive heading error means "turn left" (right wheel faster) in every phase.
 
-    State machine:
-      TURN        — rotate in place to face origin
-      DRIVE       — drive toward origin with heading correction; abort if obstacle
-      AVOID       — sidestep around obstacle (turn aside + drive forward briefly)
-      FINAL_TURN  — at origin, rotate to original heading (0 rad)
-                    then hand back to manual mode."""
+    Phases:
+      TURN        — rotate in place to face the next waypoint (more than
+                    TURN_IN_PLACE_DEG away)
+      DRIVE       — drive towards it with heading correction; a waypoint
+                    reached within ARRIVAL_TOLERANCE gives way to the next,
+                    without stopping; slower over the last SLOW_DOWN_M
+      FINAL_TURN  — at the goal, rotate to its final heading, if it has one
+    then ramp down, brake and hand back to manual mode."""
 
     PHASE_TURN       = 'turn'
     PHASE_DRIVE      = 'drive'
-    PHASE_AVOID      = 'avoid'
     PHASE_FINAL_TURN = 'final_turn'
 
     HEADING_TOLERANCE  = math.radians(3)
@@ -317,87 +323,133 @@ class GoHomeController(Controller):
     TURN_SLOW_SPEED    = 10          # motor %, enough for wheels already turning
     TURN_SLOW_DEG      = 20
     TURN_COAST_DEG     = 8
+    TURN_IN_PLACE_DEG  = 30          # a waypoint farther off than this: turn in place first
     ARRIVAL_TOLERANCE  = 0.10        # m
-    # Sidestep when the robot's corridor (navigation.collision) is free for
-    # less than this in front of the nose (the old 35 cm from the LiDAR centre)
-    AVOID_CLEARANCE_M  = 0.25
+    SLOW_DOWN_M        = 0.30        # slower over the last of the way (down to MIN_START)
     DRIVE_SPEED        = 25
     TURN_SPEED         = 22
-    AVOID_DURATION     = 1.5         # s of forward after sidestep turn
     HEADING_KP         = 25.0        # P-gain for heading correction in DRIVE
 
     def __init__(self, state: RobotState, drive: DriveBase) -> None:
         super().__init__(state, drive)
-        self._phase = self.PHASE_TURN
-        self._avoid_until = 0.0
-        self._avoid_dir   = 1        # +1 = turn left, -1 = turn right
+        self.planner: PathPlanner = PathPlanner(state)
+        self._phase: str = self.PHASE_DRIVE
+        self._goal: Optional[tuple[float, float, Optional[float]]] = None   # the goal being driven to
+        self._path: Optional[list[tuple[float, float]]] = None             # the waypoints followed
+        self._waypoint: int = 0                                            # index of the next one
 
-    def reset(self):
-        self._phase = self.PHASE_TURN
+    def goal(self) -> Optional[tuple[float, float, Optional[float]]]:
+        """Where to go: the web page's click (state.nav_goal)."""
+        return self.state.nav_goal
 
     def step(self):
+        goal = self.goal()
+        if goal is None:
+            self.state.nav_status = 'idle'
+            self._drive(0, 0)
+            return
+        if goal != self._goal:
+            self._start(goal)
+
+        if self.state.nav_path is not self._path:
+            self._follow(self.state.nav_path)
+        if self._path is None:
+            self._drive(0, 0)                # planning, or no way: wait (ramped)
+            return
+        if self.state.blocked is not None:
+            self.planner.replan_now()        # the collision guard stopped us: another way
+
         with self.state._pose_lock:
             x, y, heading = self.state.pose.x, self.state.pose.y, self.state.pose.angle_rad
 
-        if self._phase == self.PHASE_TURN:
-            self._step_turn(x, y, heading)
-        elif self._phase == self.PHASE_DRIVE:
-            self._step_drive(x, y, heading)
-        elif self._phase == self.PHASE_AVOID:
-            self._step_avoid()
-        elif self._phase == self.PHASE_FINAL_TURN:
+        if self._phase == self.PHASE_FINAL_TURN:
             self._step_final_turn(heading)
+            return
+        self._skip_reached_waypoints(x, y)
+        target_x, target_y = self._path[self._waypoint]
+        is_last = self._waypoint == len(self._path) - 1
+        distance = math.hypot(target_x - x, target_y - y)
+        if is_last and distance <= self.ARRIVAL_TOLERANCE:
+            self._arrived()
+            return
+
+        err = self._normalize_angle(math.atan2(target_y - y, target_x - x) - heading)
+        if abs(err) > math.radians(self.TURN_IN_PLACE_DEG):
+            self._phase = self.PHASE_TURN
+        if self._phase == self.PHASE_TURN:
+            if self._turned_to(err):
+                self._phase = self.PHASE_DRIVE
+            else:
+                self.state.nav_status = 'turning'
+                self._turn_toward(err)
+                return
+        self.state.nav_status = 'driving'
+        self._step_drive(err, self._distance_to_goal(x, y))
+
+    # ── the way ──
+    def _start(self, goal: tuple[float, float, Optional[float]]) -> None:
+        """A new goal: plan the way to it."""
+        self._goal = goal
+        self._path = None
+        self._phase = self.PHASE_DRIVE
+        print(f"Navigation: to ({goal[0]:+.2f}, {goal[1]:+.2f}) m", flush=True)
+        self.planner.set_goal((goal[0], goal[1]))
+
+    def _follow(self, path: Optional[list[tuple[float, float]]]) -> None:
+        """A new plan: follow it from its first waypoint (it starts where
+        the robot was when it was planned)."""
+        self._path = path
+        self._waypoint = 0
+
+    def _skip_reached_waypoints(self, x: float, y: float) -> None:
+        """Move on to the next waypoint while the current one is reached
+        (within ARRIVAL_TOLERANCE), or already behind: closer to the next
+        one than it is."""
+        while self._waypoint < len(self._path) - 1:
+            here_x, here_y = self._path[self._waypoint]
+            next_x, next_y = self._path[self._waypoint + 1]
+            to_waypoint = math.hypot(here_x - x, here_y - y)
+            robot_to_next = math.hypot(next_x - x, next_y - y)
+            waypoint_to_next = math.hypot(next_x - here_x, next_y - here_y)
+            if to_waypoint > self.ARRIVAL_TOLERANCE and robot_to_next >= waypoint_to_next:
+                return
+            self._waypoint += 1
+
+    def _distance_to_goal(self, x: float, y: float) -> float:
+        """Along the waypoints still ahead."""
+        distance = 0.0
+        from_x, from_y = x, y
+        for waypoint_x, waypoint_y in self._path[self._waypoint:]:
+            distance += math.hypot(waypoint_x - from_x, waypoint_y - from_y)
+            from_x, from_y = waypoint_x, waypoint_y
+        return distance
+
+    def _arrived(self) -> None:
+        final_heading = self._goal[2]
+        if final_heading is not None and self._phase != self.PHASE_FINAL_TURN:
+            self._phase = self.PHASE_FINAL_TURN
+            return
+        print("Navigation: arrived", flush=True)
+        self.stop()                          # ramp down, then brake
+        self.state.nav_status = 'arrived'
+        self.state.mode = RobotState.MODE_MANUAL
 
     # ── phases ──
-    def _step_turn(self, x, y, heading):
-        dx, dy = -x, -y
-        if math.hypot(dx, dy) <= self.ARRIVAL_TOLERANCE:
-            self._phase = self.PHASE_FINAL_TURN
-            return
-        err = self._normalize_angle(math.atan2(dy, dx) - heading)
-        if self._turned_to(err):
-            self._phase = self.PHASE_DRIVE
-            return
-        self._turn_toward(err)
-
-    def _step_drive(self, x, y, heading):
-        # obstacle ahead?
-        # The whole width of the robot, not the ±10° cone of frontObstacleDistance
-        # (±2 cm wide near the nose: it let the robot hit a chair leg)
-        if self.state.front_clearance_m < self.AVOID_CLEARANCE_M:
-            self._avoid_dir   = self._pick_avoidance_side()
-            self._avoid_until = time.monotonic() + self.AVOID_DURATION
-            self._phase = self.PHASE_AVOID
-            return
-
-        dx, dy = -x, -y
-        if math.hypot(dx, dy) <= self.ARRIVAL_TOLERANCE:
-            self._phase = self.PHASE_FINAL_TURN
-            return
-
-        err = self._normalize_angle(math.atan2(dy, dx) - heading)
-        correction = max(-self.DRIVE_SPEED, min(self.DRIVE_SPEED, self.HEADING_KP * err))
-        left  = self.DRIVE_SPEED - correction   # err > 0 → right wheel faster → turn left
-        right = self.DRIVE_SPEED + correction
+    def _step_drive(self, err: float, distance_to_goal: float) -> None:
+        speed = self.DRIVE_SPEED
+        if distance_to_goal < self.SLOW_DOWN_M:
+            speed = max(self.MIN_START, self.DRIVE_SPEED * distance_to_goal / self.SLOW_DOWN_M)
+        correction = max(-speed, min(speed, self.HEADING_KP * err))
+        left  = speed - correction           # err > 0 → right wheel faster → turn left
+        right = speed + correction
         self._drive(left, right)
 
-    def _step_avoid(self):
-        if time.monotonic() < self._avoid_until:
-            # roll forward while veering away from obstacle
-            turn = self._avoid_dir * self.TURN_SPEED * 0.7
-            left  = self.DRIVE_SPEED - turn     # _avoid_dir +1 → right wheel faster → turn left
-            right = self.DRIVE_SPEED + turn
-            self._drive(left, right)
-        else:
-            self._phase = self.PHASE_TURN     # re-aim at home
-
-    def _step_final_turn(self, heading):
-        err = self._normalize_angle(0.0 - heading)
+    def _step_final_turn(self, heading: float) -> None:
+        err = self._normalize_angle(self._goal[2] - heading)
         if self._turned_to(err):
-            self.stop()                       # arrived: ramp down, then brake
-            self._phase = self.PHASE_TURN     # reset for next invocation
-            self.state.mode = RobotState.MODE_MANUAL
+            self._arrived()
             return
+        self.state.nav_status = 'turning'
         self._turn_toward(err)
 
     # ── helpers ──
@@ -429,18 +481,28 @@ class GoHomeController(Controller):
             speed = self.TURN_SLOW_SPEED
         s = direction * speed
         self._drive(-s, s, min_speed=self.TURN_SLOW_SPEED)   # s > 0: left backward, right forward → CCW (left)
-    def _pick_avoidance_side(self):
-        """Scan lidar arcs 30–90° (right) vs 270–330° (left); turn toward the freer side."""
-        left_min = right_min = float('inf')
-        for q, a, d in self.state.last_scan:
-            if q == 0 or d <= 0: continue
-            if 30 <= a <= 90:
-                right_min = min(right_min, d)
-            elif 270 <= a <= 330:
-                left_min = min(left_min, d)
-        # if both ~equal/no data, default to left
-        return 1 if left_min >= right_min else -1
 
     def stop(self):
-        self._phase = self.PHASE_TURN
+        """Mode change, arrival: ramp down, then brake; forget the goal."""
+        if self._goal is not None and self.state.nav_goal == self._goal:
+            self.state.nav_goal = None       # not a goal set meanwhile by a new click
+        if self._goal is not None and self.state.nav_status not in ('arrived', 'no path', 'no map'):
+            self.state.nav_status = 'stopped'
+        self.planner.cancel()
+        self._goal = None
+        self._path = None
+        self._phase = self.PHASE_DRIVE
         super().stop()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+class GoHomeController(NavigateController):
+    """Go back to where the robot started, facing the way it started:
+    the navigation to (0, 0), final heading 0 (the odometry's origin)."""
+
+    HOME = (0.0, 0.0, 0.0)
+
+    def goal(self) -> tuple[float, float, Optional[float]]:
+        if self._goal is None:
+            self.state.nav_goal = self.HOME  # shown on the web page's map
+        return self.HOME

@@ -17,6 +17,10 @@ import numpy as np
 from .robot_profile import load_profile
 
 OdomPose = tuple[float, float, float]      # x m, y m, θ rad
+# Where a map picture was cut from the whole map: (left column, top row) on
+# the whole map picture, and its scale (picture pixels per map pixel).
+# map_view_image() returns it; picture_to_world() turns a click back into x, y.
+MapView = tuple[float, float, float]
 
 # ── LiDAR mounting ─────────────────────────────────────────────────────────
 # From the robot profile (robot_profile.json), measured by
@@ -216,13 +220,25 @@ class LidarSlam:
             self._slam.getmap(pixels)
         return pixels
 
-    def map_image(self, width: int = 500, height: int = 500):
+    def map_image(self, width: int = 500, height: int = 500,
+                  path: Optional[list[tuple[float, float]]] = None,
+                  goal: Optional[tuple[float, float]] = None):
+        """The map as a PIL RGB image: see map_view_image()."""
+        picture, _ = self.map_view_image(width, height, path, goal)
+        return picture
+
+    def map_view_image(self, width: int = 500, height: int = 500,
+                       path: Optional[list[tuple[float, float]]] = None,
+                       goal: Optional[tuple[float, float]] = None) -> tuple:
         """The map as a PIL RGB image of width × height, seen from above, the
         first scan's forward direction up (its left on the left): the robot's
         trail and at least MAP_VIEW_RADIUS_M around it, widened to the
-        picture's proportions (never stretched). The trail (red) and the
-        robot (green triangle pointing where it faces) are drawn after the
-        resizing, so that they stay sharp when small."""
+        picture's proportions (never stretched). The trail (red), the robot
+        (green triangle pointing where it faces), the planned path (blue,
+        from the robot through its waypoints, x y in m) and the goal (yellow
+        cross) are drawn after the resizing, so that they stay sharp when
+        small. Returns (picture, MapView): the view turns a click on the
+        picture back into x, y (picture_to_world)."""
         from PIL import Image, ImageDraw
 
         # BreezySLAM's map: pixels[y][x], y up. The picture puts +x up and +y
@@ -263,10 +279,23 @@ class LidarSlam:
         if len(trail) > 1:
             draw.line([on_picture(pose) for pose in trail], fill=(255, 0, 0),
                       width=max(2, round(min(width, height) / 150)))
+        line_width = max(2, round(min(width, height) / 150))
+        if path and trail:
+            path_on_picture = [on_picture(trail[-1])] + [on_picture(point) for point in path]
+            draw.line(path_on_picture, fill=(60, 140, 255), width=line_width)
+        if goal is not None:
+            self._draw_cross(draw, on_picture(goal), max(6.0, min(width, height) / 40), line_width)
         if trail:
             robot_length = max(10.0, 0.3 * MAP_SIZE_PIXELS / MAP_SIZE_METERS * scale)
             self._draw_robot(draw, on_picture(trail[-1]), trail[-1][2] - self._origin[2], robot_length)
-        return picture
+        return picture, (float(left), float(top), float(scale))
+
+    @staticmethod
+    def _draw_cross(draw, position: tuple[float, float], size: float, width: int) -> None:
+        """A yellow cross at position (the navigation goal)."""
+        column, row = position
+        draw.line([(column - size, row - size), (column + size, row + size)], fill=(255, 220, 0), width=width)
+        draw.line([(column - size, row + size), (column + size, row - size)], fill=(255, 220, 0), width=width)
 
     @staticmethod
     def _shrunk_keeping_walls(picture, size: tuple[int, int]):
@@ -307,16 +336,48 @@ class LidarSlam:
         """Shift a crop so that it stays on the map (if it fits)."""
         return max(0.0, min(start, MAP_SIZE_PIXELS - length))
 
-    def _picture_pixel(self, pose: OdomPose) -> tuple[float, float]:
-        """Column, row of an odometry-frame pose on the whole map picture."""
+    @property
+    def has_map(self) -> bool:
+        """True once the first scan has placed the map in the odometry frame."""
+        return self._origin is not None
+
+    def world_to_map(self, x: float, y: float) -> tuple[float, float]:
+        """Map pixel (map_x, map_y) of an odometry-frame point (m): the map's
+        pixels[map_y][map_x] (map_pixels()). Needs has_map."""
         origin_x, origin_y, origin_theta = self._origin
-        dx, dy = pose[0] - origin_x, pose[1] - origin_y
+        dx, dy = x - origin_x, y - origin_y
         # In the frame of the first scan (BreezySLAM's map frame), in pixels
         pixels_per_m = MAP_SIZE_PIXELS / MAP_SIZE_METERS
         forward = dx * math.cos(origin_theta) + dy * math.sin(origin_theta)
         left = -dx * math.sin(origin_theta) + dy * math.cos(origin_theta)
         map_x = (self._start_x_mm / 1000 + forward) * pixels_per_m
         map_y = (self._start_y_mm / 1000 + left) * pixels_per_m
+        return map_x, map_y
+
+    def map_to_world(self, map_x: float, map_y: float) -> tuple[float, float]:
+        """Odometry-frame point (m) of a map pixel: the inverse of world_to_map()."""
+        origin_x, origin_y, origin_theta = self._origin
+        pixels_per_m = MAP_SIZE_PIXELS / MAP_SIZE_METERS
+        forward = map_x / pixels_per_m - self._start_x_mm / 1000
+        left = map_y / pixels_per_m - self._start_y_mm / 1000
+        x = origin_x + forward * math.cos(origin_theta) - left * math.sin(origin_theta)
+        y = origin_y + forward * math.sin(origin_theta) + left * math.cos(origin_theta)
+        return x, y
+
+    def picture_to_world(self, column: float, row: float, view: MapView) -> tuple[float, float]:
+        """Odometry-frame point (m) of a pixel of a map picture, from the
+        view map_view_image() returned with that picture."""
+        left, top, scale = view
+        whole_column = left + column / scale
+        whole_row = top + row / scale
+        # The whole picture puts +x up and +y on the left (see _picture_pixel)
+        map_y = MAP_SIZE_PIXELS - whole_column
+        map_x = MAP_SIZE_PIXELS - whole_row
+        return self.map_to_world(map_x, map_y)
+
+    def _picture_pixel(self, pose: OdomPose) -> tuple[float, float]:
+        """Column, row of an odometry-frame pose on the whole map picture."""
+        map_x, map_y = self.world_to_map(pose[0], pose[1])
         return MAP_SIZE_PIXELS - map_y, MAP_SIZE_PIXELS - map_x
 
     @staticmethod

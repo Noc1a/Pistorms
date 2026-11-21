@@ -24,6 +24,7 @@ class RobotState:
     MODE_MANUAL = 'manual'
     MODE_FOLLOW = 'follow'
     MODE_HOME   = 'home'
+    MODE_GOTO   = 'goto'
 
     def __init__(self, running):
         # The robot's pose: the odometry corrected by the SLAM (Odometry thread,
@@ -75,3 +76,11 @@ class RobotState:
         self.mode = RobotState.MODE_MANUAL
         self.manual_cmd = {'fwd': 0.0, 'turn': 0.0, 'speed': 30}   # -1..1, -1..1, 0..100
         self.follow_target = 'person'
+        # Navigation (NavigateController, navigation.path_planner): the goal
+        # (x m, y m, final heading rad or None), set by a click on the web
+        # page's map or by the Go Home mode; the planned waypoints [(x, y)]
+        # (None: no way, or not planned yet); what the navigation is doing
+        self.nav_goal: Optional[tuple[float, float, Optional[float]]] = None
+        self.nav_path: Optional[list[tuple[float, float]]] = None
+        self.nav_status: str = 'idle'     # idle, planning, driving, arrived, stopped, no path, no map
+        self.nav_plan_secs: float = 0.0   # time of the last plan (Pi load)
