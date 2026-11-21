@@ -5,9 +5,9 @@ and the LiDAR are.
 One JSON file per model. The default is robot_profile.json at the repo root;
 the environment variable ROBOT_PROFILE points to another one:
 
-    ROBOT_PROFILE=profiles/small_bot.json python3 -u tests/calibrateSensors.py
+    ROBOT_PROFILE=profiles/small_bot.json python3 -u -m navigation.calibration all
 
-tests/calibrateSensors.py writes the file: a wizard on the PiStorms screen
+navigation/calibration writes the file: a wizard in the terminal
 asks for what must be measured by hand, and the robot measures the rest.
 
     {
@@ -25,7 +25,7 @@ asks for what must be measured by hand, and the robot measures the rest.
       "imu_port": "BBS2",         sensor port of the AbsoluteIMU; left out: no IMU
       "gyro_z_sign": -1,          -1 if a counter-clockwise turn reads negative gyro Z
       "imu_up_axis": "-z",        IMU axis that points up    } measured by
-      "imu_forward_axis": "+x",   IMU axis that points ahead } calibrateSensors.py
+      "imu_forward_axis": "+x",   IMU axis that points ahead } the IMU calibration
 
       "lidar_port": "/dev/ttyUSB0",   serial port of the RPLidar; left out: no LiDAR
       "lidar_dx": 0.078,          m, LiDAR rotation centre ahead of the wheel axle
@@ -184,7 +184,7 @@ def load_profile(path: Optional[str] = None) -> RobotProfile:
         return profile_from_json(data)
     except (TypeError, ValueError) as error:
         raise ValueError(f"{path}: {error} — fix the file, or run "
-                         f"tests/calibrateSensors.py on the robot") from error
+                         f"python3 -u -m navigation.calibration setup on the robot") from error
 
 
 def save_profile(profile: RobotProfile, path: Optional[str] = None) -> str:

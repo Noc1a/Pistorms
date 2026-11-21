@@ -20,7 +20,7 @@ OdomPose = tuple[float, float, float]      # x m, y m, θ rad
 
 # ── LiDAR mounting ─────────────────────────────────────────────────────────
 # From the robot profile (robot_profile.json), measured by
-# tests/calibrateSensors.py. Which way the LiDAR points (lidar_yaw_deg) is
+# the LiDAR calibration (navigation/calibration). Which way the LiDAR points (lidar_yaw_deg) is
 # not needed here: the scans arrive robot-oriented (lidar_reader.rotate_scan).
 _PROFILE      = load_profile()
 LIDAR_DX      = _PROFILE.lidar_dx    # m, LiDAR rotation centre ahead of the drive-wheel axle

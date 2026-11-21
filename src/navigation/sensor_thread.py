@@ -114,7 +114,7 @@ class Odometry(Sensor):
         self.wheel_circumference: float = profile.wheel_circumference
         self.wheel_base: float = profile.wheel_base
         # The gyro axis that points up, and its sign for a counter-clockwise
-        # turn: measured by tests/calibrateSensors.py, else Z
+        # turn: measured by the IMU calibration (navigation/calibration), else Z
         up_axis = profile.imu_up_axis or ('+z' if profile.gyro_z_sign > 0 else '-z')
         self._gyro_axis: str = up_axis[1]
         self._gyro_sign: int = 1 if up_axis[0] == '+' else -1
