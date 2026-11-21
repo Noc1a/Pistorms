@@ -11,7 +11,6 @@ from typing import Optional
 
 import numpy as np
 
-from PIL import Image as _PILImage
 from picamera2 import Picamera2
 from picamera2.devices import IMX500
 from pistorms import PiStorms
@@ -304,9 +303,12 @@ class Camera(Sensor):
             try:
                 if time.monotonic() - self.state.last_frame_request > self.FRAME_VIEWER_TIMEOUT:
                     return
-                arr = request.make_array("main")
+                # make_image, not make_array + Image.fromarray: Picamera2's
+                # "RGB888" stores its pixels blue, green, red (OpenCV order),
+                # and fromarray took them for red, green, blue — pink flowers
+                # came out blue. make_image reads them in the right order.
                 buf = io.BytesIO()
-                _PILImage.fromarray(arr).save(buf, format='JPEG', quality=65)
+                request.make_image("main").save(buf, format='JPEG', quality=65)
                 self.state.last_frame = buf.getvalue()
             except Exception:
                 pass
