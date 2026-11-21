@@ -37,6 +37,25 @@ pip install -e "PiStorms[robot]" --config-settings editable_mode=compat
 pip install -r requirements.txt     # ahrs, rplidar-roboticia, matplotlib
 ```
 
+### Commandes du terminal
+
+Le `pip install -e` crée aussi les commandes déclarées dans `pyproject.toml`
+(`[project.scripts]`), dans `~/Projects/env/bin/` :
+
+| Commande | Rôle |
+|---|---|
+| `voltage` | Affiche la tension de la batterie toutes les 5 s et l'écrit dans `~/voltage_log.txt` (Ctrl-C pour arrêter). |
+
+Elles ne sont trouvées que si le venv est activé. Pour les appeler depuis
+n'importe où, venv activé ou non, créer un lien (une fois par commande) :
+
+```bash
+sudo ln -s ~/Projects/env/bin/voltage /usr/local/bin/voltage
+```
+
+Après l'ajout d'une commande dans `pyproject.toml`, relancer le `pip install -e`
+ci-dessus, puis créer son lien.
+
 ## 3. Services système
 
 ```bash
@@ -59,6 +78,7 @@ systemctl status psm_batt_monitor lidar-pause   # les deux "active (running)"
 ls -l /dev/rplidar                              # -> ttyUSB0
 python3 -m unittest discover unitTests          # tous OK
 python3 tests/testScreen.py                     # écran et tactile
+cd /tmp && voltage                              # une tension toutes les 5 s, Ctrl-C
 ```
 
 ## Pourquoi `lidar-pause` existe

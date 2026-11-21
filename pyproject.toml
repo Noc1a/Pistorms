@@ -13,6 +13,10 @@ dependencies = ["numpy", "pillow"]
 [project.optional-dependencies]
 robot = ["rplidar-roboticia"]
 
+# Commands installed in the venv's bin/ (redo the pip install below after a change here)
+[project.scripts]
+voltage = "pistorms.scripts.logTension:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
