@@ -9,6 +9,7 @@ sensors are mounted.
     calibrator.py    Calibrator: runs the calibrations, what they require first
     base.py          Calibration (record / solve) and what they share on the robot
     wizard.py        the values measured by hand, asked in the terminal
+    motor_start.py   MotorStartCalibration: the slowest speed that starts the wheels
     imu_axes.py      ImuAxesCalibration: which IMU axis points up, which ahead
     lidar_mount.py   LidarMountCalibration: where the LiDAR is, which way it points
     lidar_verify.py  LidarMountCheck: does the profile's LiDAR mounting hold
@@ -22,3 +23,4 @@ from .compass import CompassCalibration
 from .imu_axes import ImuAxesCalibration
 from .lidar_mount import LidarMountCalibration
 from .lidar_verify import LidarMountCheck
+from .motor_start import MotorStartCalibration

@@ -3,18 +3,21 @@ how its sensors are mounted.
 
     python3 -u -m navigation.calibration all            # a new or rebuilt model
     python3 -u -m navigation.calibration setup imu lidar
+    python3 -u -m navigation.calibration motors         # after a change of weight or wheels
     python3 -u -m navigation.calibration compass [--mode 3d] [--secs 60] [--continuous]
     python3 -u -m navigation.calibration verify
 
   setup    wizard in the terminal: wheels, motor ports and directions, size
            of the robot, sensor ports — what must be measured by hand
+  motors   the slowest motor speed that starts the wheels on the floor (it
+           depends on the weight): min_start_speed
   imu      which IMU axis points up and which ahead (pivot, short dashes)
   lidar    where the LiDAR is and which way it points (a turn in 12 stops,
            25 cm forward and back)
   compass  hard and soft iron of the magnetometer (2d: the robot spins;
            3d: turned by hand)
   verify   checks the LiDAR direction and offset of the profile
-  all      setup, imu, lidar, compass
+  all      setup, motors, imu, lidar, compass
 
 What a calibration builds on is run first if it is not done yet (the
 compass needs the IMU axes, the check needs the LiDAR calibration, all need
@@ -23,6 +26,7 @@ profile is saved after each step.
 
 A saved recording can be solved again, on the Pi or on the Mac:
 
+    python3 -m navigation.calibration motors  --from calibration_runs/motors_<date>.json
     python3 -m navigation.calibration lidar   --from calibration_runs/lidarcal_<date>.json
     python3 -m navigation.calibration verify  --from calibration_runs/verify_<date>.json
     python3 -m navigation.calibration compass --from calibration_runs/compass2d_<date>.csv
@@ -39,12 +43,13 @@ from .compass import CompassCalibration
 from .imu_axes import ImuAxesCalibration
 from .lidar_mount import LidarMountCalibration
 from .lidar_verify import LidarMountCheck
+from .motor_start import MotorStartCalibration
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(prog='python3 -m navigation.calibration', description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('what', nargs='+', choices=['setup', 'imu', 'lidar', 'compass', 'verify', 'all'])
+    parser.add_argument('what', nargs='+', choices=['setup', 'motors', 'imu', 'lidar', 'compass', 'verify', 'all'])
     parser.add_argument('--from', dest='source', help="solve a saved recording again (no robot)")
     parser.add_argument('--force', action='store_true',
                         help="redo what the calibrations asked for build on, even if already done")
@@ -55,12 +60,12 @@ def main() -> None:
     parser.add_argument('--show', action='store_true', help="compass: also open the plot windows")
     args = parser.parse_args()
 
-    calibrator = Calibrator([ImuAxesCalibration(), LidarMountCalibration(),
+    calibrator = Calibrator([MotorStartCalibration(), ImuAxesCalibration(), LidarMountCalibration(),
                              CompassCalibration(args.mode, args.continuous, args.secs, args.show),
                              LidarMountCheck()])
     if args.source:
-        if len(args.what) != 1 or args.what[0] not in ('lidar', 'compass', 'verify'):
-            parser.error("--from goes with one of: lidar, compass, verify")
+        if len(args.what) != 1 or args.what[0] not in ('motors', 'lidar', 'compass', 'verify'):
+            parser.error("--from goes with one of: motors, lidar, compass, verify")
         for line in calibrator.replay(args.what[0], args.source):
             print(line)
     else:

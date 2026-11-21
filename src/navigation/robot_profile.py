@@ -21,6 +21,9 @@ asks for what must be measured by hand, and the robot measures the rest.
       "body_front": 0.188,        m, nose of the robot ahead of the wheel axle
       "body_rear": 0.172,         m, back of the robot behind the wheel axle
       "body_width": 0.19,         m
+      "min_start_speed": 10,      optional: motor %, the slowest that starts a wheel
+                                  standing still, on the floor (measured by the
+                                  motors calibration: it depends on the weight)
 
       "imu_port": "BBS2",         sensor port of the AbsoluteIMU; left out: no IMU
       "gyro_z_sign": -1,          -1 if a counter-clockwise turn reads negative gyro Z
@@ -59,6 +62,9 @@ WHEELS: dict[str, float] = {
 }
 
 TICKS_PER_REV = 360.0      # encoder ticks per wheel turn (LEGO NXT/EV3 motors)
+# Motor % that starts a wheel standing still, when the profile has no measured
+# min_start_speed: the first model measured 8 % (2026-11-21), plus a margin
+DEFAULT_MIN_START_SPEED = 10
 SENSOR_PORTS = ('BAS1', 'BAS2', 'BBS1', 'BBS2')
 AXES = ('+x', '-x', '+y', '-y', '+z', '-z')
 
@@ -88,6 +94,7 @@ class RobotProfile:
     lidar_dy: float = 0.0
     lidar_yaw_deg: float = 0.0
     wheel_diameter_measured: Optional[float] = None
+    min_start_speed_measured: Optional[int] = None
 
     def __post_init__(self) -> None:
         if self.wheel not in WHEELS:
@@ -109,6 +116,8 @@ class RobotProfile:
                 raise ValueError(f"{name} must be one of {', '.join(AXES)}")
         if self.lidar_port is not None:
             self._check_lidar_is_on_the_robot()
+        if self.min_start_speed_measured is not None and not 1 <= self.min_start_speed_measured <= 50:
+            raise ValueError("min_start_speed must be a motor % between 1 and 50")
 
     def _check_lidar_is_on_the_robot(self) -> None:
         """The collision guard takes the robot's outline from body_front /
@@ -127,6 +136,14 @@ class RobotProfile:
         if self.wheel_diameter_measured is not None:
             return self.wheel_diameter_measured
         return WHEELS[self.wheel]
+
+    @property
+    def min_start_speed(self) -> int:
+        """Motor %: the slowest that starts a wheel standing still — the
+        measured one if the profile has it, else DEFAULT_MIN_START_SPEED."""
+        if self.min_start_speed_measured is not None:
+            return self.min_start_speed_measured
+        return DEFAULT_MIN_START_SPEED
 
     @property
     def wheel_circumference(self) -> float:
@@ -154,6 +171,8 @@ class RobotProfile:
         data = {name: value for name, value in self.__dict__.items() if value is not None}
         if 'wheel_diameter_measured' in data:
             data['wheel_diameter'] = data.pop('wheel_diameter_measured')
+        if 'min_start_speed_measured' in data:
+            data['min_start_speed'] = data.pop('min_start_speed_measured')
         if self.imu_port is None:
             data.pop('gyro_z_sign')
         if self.lidar_port is None:
@@ -171,8 +190,9 @@ def profile_path(path: Optional[str] = None) -> str:
 
 def profile_from_json(data: dict) -> RobotProfile:
     data = dict(data)
-    # "wheel_diameter" in the file is the optional measured value
+    # "wheel_diameter" and "min_start_speed" in the file are optional measured values
     data['wheel_diameter_measured'] = data.pop('wheel_diameter', None)
+    data['min_start_speed_measured'] = data.pop('min_start_speed', None)
     return RobotProfile(**data)
 
 

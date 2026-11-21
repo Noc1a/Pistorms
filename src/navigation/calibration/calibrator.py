@@ -4,7 +4,7 @@
 
     Calibrator().run(['compass'])       # runs the IMU calibration first if
                                         # the profile doesn't have it yet
-    Calibrator().run(['all'])           # wizard, IMU, LiDAR, compass
+    Calibrator().run(['all'])           # wizard, motors, IMU, LiDAR, compass
 
 It knows what each calibration builds on (Calibration.requires) and runs
 what is missing first; it opens the board once, saves the profile after each
@@ -22,24 +22,25 @@ from .compass import CompassCalibration
 from .imu_axes import ImuAxesCalibration
 from .lidar_mount import LidarMountCalibration
 from .lidar_verify import LidarMountCheck
+from .motor_start import MotorStartCalibration
 from .wizard import TerminalWizard, ask_settings, profile_from_values, read_values
 
 if TYPE_CHECKING:
     from pistorms import PiStorms
 
 SETUP = 'setup'                                     # the wizard: not a Calibration
-ALL: tuple[str, ...] = (SETUP, 'imu', 'lidar', 'compass')
+ALL: tuple[str, ...] = (SETUP, 'motors', 'imu', 'lidar', 'compass')
 
 
 class Calibrator:
 
     def __init__(self, calibrations: Optional[list[Calibration]] = None,
                  psm: Optional['PiStorms'] = None, ui: Optional[TerminalWizard] = None) -> None:
-        """calibrations: the ones it can run (default: IMU axes, LiDAR
-        mounting, compass 2d, LiDAR check). psm: the board, opened on first
-        use if not given."""
+        """calibrations: the ones it can run (default: motor start speed,
+        IMU axes, LiDAR mounting, compass 2d, LiDAR check). psm: the board,
+        opened on first use if not given."""
         if calibrations is None:
-            calibrations = [ImuAxesCalibration(), LidarMountCalibration(),
+            calibrations = [MotorStartCalibration(), ImuAxesCalibration(), LidarMountCalibration(),
                             CompassCalibration(), LidarMountCheck()]
         self.calibrations: dict[str, Calibration] = {calibration.name: calibration
                                                      for calibration in calibrations}
@@ -96,7 +97,7 @@ class Calibrator:
             return None
 
     def run(self, names: list[str], force: bool = False) -> list[str]:
-        """Run these calibrations ('setup', 'imu', 'lidar', 'compass',
+        """Run these calibrations ('setup', 'motors', 'imu', 'lidar', 'compass',
         'verify', 'all'), and first what they require if it is not done yet
         (force: even if it is). Returns one line per step: what happened."""
         expanded: list[str] = []
