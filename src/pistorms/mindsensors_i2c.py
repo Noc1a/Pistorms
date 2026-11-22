@@ -28,10 +28,17 @@
 ## @package mindsensors_i2c
 # This is the i2c module for mindsensors i2c devices.
 
-import smbus
 import ctypes
 import threading
 import time
+
+# smbus2, not the smbus C module: smbus keeps Python's lock (GIL) during each
+# I2C transfer (1–4 ms), so every transfer froze all the other threads —
+# measured 2026-11-22 on the Pi, a counting thread ran at 49 % next to
+# continuous smbus reads, 99 % next to smbus2 reads (same speed alone,
+# 1.05 ms per byte). In Follow mode the motor ramps and the odometry kept the
+# bus busy, and the camera fell from 26 to 2–9 detections per second.
+from smbus2 import SMBus
 
 # Transient bus errors (e.g. Errno 121 Remote I/O) are common on the PiStorms
 # bus while motors run. Every transaction is retried this many times before
@@ -63,7 +70,7 @@ class mindsensors_i2c(object):
     #  @param i2c_address Address of your device.
     def __init__(self, i2c_address):
         self.address = i2c_address
-        self.bus = smbus.SMBus(I2C_BUS)
+        self.bus = SMBus(I2C_BUS)
         # None = not probed yet; True/False = device does/doesn't return the
         # same bytes for a block read as for individual byte reads.
         self._block_read_ok = None

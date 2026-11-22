@@ -7,8 +7,10 @@ name = "pistorms-robot"
 version = "0.1.0"
 description = "PiStorms board library (pistorms) and the person-follower robot's navigation (navigation)"
 requires-python = ">=3.9"
-# smbus and picamera2 come from the system packages on the Raspberry Pi
-dependencies = ["numpy", "pillow"]
+# picamera2 comes from the system packages on the Raspberry Pi. smbus2 (I2C)
+# too, on Raspberry Pi OS; pure Python, it installs anywhere (the Mac's tests
+# replace it anyway)
+dependencies = ["numpy", "pillow", "smbus2"]
 
 [project.optional-dependencies]
 robot = ["rplidar-roboticia"]
