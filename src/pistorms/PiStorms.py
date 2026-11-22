@@ -116,12 +116,18 @@ class PiStorms:
         except OSError:
             return None
 
-    def Shutdown(self) -> None:
+    def Shutdown(self) -> bool:
         """Power off the Raspberry Pi. systemd stops everything cleanly
         (disks flushed, logs saved); at the very end, its hook
         /usr/lib/systemd/system-shutdown/pistorms-poweroff calls
-        startBoardPowerOff() to cut the board power."""
-        subprocess.run(["/bin/systemctl", "poweroff"])
+        startBoardPowerOff() to cut the board power.
+        Returns False if the shutdown was refused (its reason printed): as
+        user robot, it needs the polkit rule system/50-robot-poweroff.rules."""
+        result = subprocess.run(["/bin/systemctl", "poweroff"], capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"Shutdown refused: {result.stderr.strip() or result.returncode}", flush=True)
+            return False
+        return True
 
     def startBoardPowerOff(self) -> None:
         """Start the board's power-cut countdown. Only for the systemd

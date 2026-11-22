@@ -147,8 +147,15 @@ def main() -> None:
             print(f"Battery low: {voltage:.2f} V ({low_count}/{LOW_READINGS_TO_SHUTDOWN})")
             if low_count >= LOW_READINGS_TO_SHUTDOWN:
                 print("Battery too low! Shutting down...")
-                psm.Shutdown()
-                break
+                if psm.Shutdown():
+                    break
+                # Refused (see the line printed by Shutdown): keep blinking
+                # and try again — never stop watching a battery running down
+                print("Shutdown refused: trying again. Is "
+                      "/etc/polkit-1/rules.d/50-robot-poweroff.rules installed?", flush=True)
+                if blink_thread is None or not blink_thread.is_alive():
+                    blink_thread = threading.Thread(target=blink_led, daemon=True)
+                    blink_thread.start()
             time.sleep(LOW_RECHECK_INTERVAL)
             continue
         low_count = 0

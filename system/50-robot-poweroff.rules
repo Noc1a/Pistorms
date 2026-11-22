@@ -1,0 +1,14 @@
+// Lets user "robot" power the Pi off without a password, and nothing else.
+// The battery monitor (psm_batt_monitor.service, User=robot) runs
+// "systemctl poweroff" when the battery is low; without this rule polkit
+// asked for authentication, which a service can't give: the shutdown was
+// refused every time and a LiPo ran down to 5.8 V (2026-11-22).
+// power-off-multiple-sessions: when an SSH session is open at the same time.
+// Installed by install.sh into /etc/polkit-1/rules.d/.
+polkit.addRule(function(action, subject) {
+    if ((action.id == "org.freedesktop.login1.power-off" ||
+         action.id == "org.freedesktop.login1.power-off-multiple-sessions") &&
+        subject.user == "robot") {
+        return polkit.Result.YES;
+    }
+});
