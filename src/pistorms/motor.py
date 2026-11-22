@@ -19,11 +19,16 @@
 #please support mindsensors.com  by purchasing products from mindsensors.com!
 #Learn more product option visit us @  http://www.mindsensors.com/
 
+import math
 import threading
 import time
 
 from . import registers
 from .mindsensors_i2c import mindsensors_i2c
+
+# Software ramps (acceleration=): one speed write every this many seconds at
+# most. Each write is an I2C transfer during which smbus holds Python's lock.
+RAMP_STEP_SECS = 0.02
 
 
 ## PiStormsMotor: one motor port of the PiStorms (psm.BAM1, BAM2, BBM1, BBM2).
@@ -123,10 +128,17 @@ class PiStormsMotor():
             start_speeds = [self.getSpeed(i) for i in indices]
             changes = [speeds[n] - start_speeds[n] for n in range(len(speeds))]
 
-            # 1 % per step on the motor whose speed changes most;
-            # the other motor follows proportionally, so both arrive together
-            nb_steps = int(max(abs(change) for change in changes))
-            step_duration = 1.0 / acceleration
+            # One write every RAMP_STEP_SECS at most, the motor whose speed
+            # changes most setting the pace; the other motor follows
+            # proportionally, so both arrive together. (It was one write per
+            # 1 %: up to 600 writes/s, and smbus holds Python's lock (GIL)
+            # during each 3–4 ms transfer, so the ramps starved the other
+            # threads — the camera fell from 26 to 2 detections/s in Follow
+            # mode, 2026-11-22.)
+            biggest_change = max(abs(change) for change in changes)
+            ramp_duration = biggest_change / acceleration
+            nb_steps = max(1, math.ceil(ramp_duration / RAMP_STEP_SECS))
+            step_duration = ramp_duration / nb_steps
             ramp_start = time.monotonic()
 
             # All the steps but the last; the last one is send_final_command()
