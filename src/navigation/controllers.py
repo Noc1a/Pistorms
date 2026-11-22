@@ -265,7 +265,18 @@ class FollowObjectController(Controller):
     """Follow the detection of class state.follow_target: proportional
     control on its place in the image (turn) and on its distance (forward),
     as in June, when it followed well.
-    If target lost > LOSS_TIMEOUT seconds, rotate slowly to search.
+    Safety (2026-11-22: the robot drove on toward where the person had
+    been, a second earlier, and down a stair the LiDAR can't see):
+    - it follows only a detection from an image younger than FRESH_SECS
+      (state.targetPose.pose_timestamp is when the image was taken). With
+      an older one it no longer turns towards it, and its forward speed
+      fades out until STALE_SECS, then it stands still and waits. (Stopping
+      dead at FRESH_SECS jerked the robot: an image a little late, or a
+      frame or two where the model misses the person, happen all the time.);
+    - lost for LOSS_TIMEOUT, it searches by turning in place, no forward
+      speed left over, towards the side of the image where the person was
+      last seen (it always turned right: a person lost on the left was
+      found again only after almost a full turn).
 
     The wheels get at least MIN_SPEED, as in June: far below what starts a
     wheel (6–8 % on the first model), so a small correction (under ~30 px)
@@ -274,9 +285,27 @@ class FollowObjectController(Controller):
     turned the robot, it turned past the person because the camera is late,
     and swung from side to side (2026-11-21)."""
 
-    LOSS_TIMEOUT   = 1.5      # s
+    # Ramp of every wheel speed change (Controller._drive), steeper than the
+    # other modes' 200 %/s: the ramp is part of the delay between seeing the
+    # person and turning. Measured 2026-11-22: camera ~80 ms (image to
+    # detection, web page open), loop ≤ 50 ms, and at 200 %/s a reversal
+    # from +16 % to −16 % took 160 ms more — the robot turned 25–30° past
+    # the person. 600 %/s: 53 ms; 1200 %/s (2026-11-22, trying whether the
+    # robot jolts): 27 ms, still a ramp (0 → 20 % in 17 ms).
+    ACCELERATION   = 1200     # %/s
+    FRESH_SECS     = 0.3      # s, the image of a detection the robot follows is younger
+    STALE_SECS     = 0.8      # s, the forward speed has faded out to 0 by this image age
+    # Forward speed (%) towards a person the camera sees but whose distance
+    # the LiDAR doesn't give (too far, or its sparse scan missed the legs):
+    # it stood still in front of the person (2026-11-22)
+    APPROACH_WITHOUT_DISTANCE = 15
+    LOSS_TIMEOUT   = 1.5      # s, then search
     SEARCH_TURN    = 12       # motor units while searching
-    KP_TURN        = 0.2
+    # Turn speed (%) per pixel of the person's offset in the image. 0.2 in
+    # June; 2026-11-22 the robot turned 23 % for a person at the left edge
+    # (−116 px) and the next images showed them at the right edge (+118 px),
+    # then lost: 0.12 gives ~12 % at 100 px.
+    KP_TURN        = 0.12
     KP_DIST        = 2.5
     MIN_SPEED      = 3
     MAX_TURN       = 40
@@ -294,6 +323,7 @@ class FollowObjectController(Controller):
         self._cur_base = 0.0
         self._cur_turn = 0.0
         self._moving   = False
+        self._last_side: int = 1             # where the person was last seen: +1 right, −1 left
         self._last_status_time: float = -math.inf
 
     def step(self):
@@ -304,30 +334,52 @@ class FollowObjectController(Controller):
         """One step of following; returns what the robot does (for the status line)."""
         tgt = self.state.targetPose
         ts  = tgt.pose_timestamp
-        target_visible = ts is not None and (time.monotonic() - ts) < self.LOSS_TIMEOUT
+        image_age = math.inf if ts is None else time.monotonic() - ts
 
-        if not target_visible:
-            # search: drift base→0, hold a slow turn
-            self._cur_base = self._ramp(self._cur_base, 0.0, self.MAX_STEP_DEC)
-            self._cur_turn = self._ramp(self._cur_turn, self.SEARCH_TURN, 2)
-            left  = self._cur_base + self._cur_turn
-            right = self._cur_base - self._cur_turn
-            self._drive(left, right)
+        if image_age >= self.LOSS_TIMEOUT:
+            # search: turn in place, a slow turn towards where the person was
+            # last seen; no forward speed left over
+            self._cur_base = 0.0
+            search_turn = self._last_side * self.SEARCH_TURN     # > 0: turn right
+            self._cur_turn = self._ramp(self._cur_turn, search_turn, 2)
+            self._drive(self._cur_turn, -self._cur_turn)
             self._moving = True
             return 'searching'
 
+        if image_age > self.FRESH_SECS:
+            # Where the person was, not where they are: no more turning
+            # towards it, and the forward speed fades out (1 at FRESH_SECS,
+            # 0 at STALE_SECS). _cur_base is kept: a fresh detection carries
+            # on from it, without a jerk.
+            self._cur_turn = 0.0
+            fade_span = self.STALE_SECS - self.FRESH_SECS
+            speed_kept = max(0.0, 1.0 - (image_age - self.FRESH_SECS) / fade_span)
+            forward = self._cur_base * speed_kept
+            if abs(forward) < 1:
+                self._drive(0, 0)
+                return 'waiting for a fresh detection'
+            self._drive(forward, forward, min_speed=self.MIN_SPEED)
+            return 'detection getting old, slowing down'
+
         x_error = tgt.x
+        if abs(x_error) > self.DEAD_ZONE_X:
+            self._last_side = 1 if x_error > 0 else -1
         if self.state.frontObstacleDistance is not None:
             distance_error = self.state.frontObstacleDistance * 0.1 - 50
         elif self.state.targetDistance is not None:
             distance_error = self.state.targetDistance * 0.1 - 80
         else:
-            distance_error = 0.0
+            distance_error = None          # seen by the camera, not by the LiDAR
 
-        target_base = max(-self.MAX_BASE, min(self.MAX_BASE, distance_error * self.KP_DIST))
+        if distance_error is None:
+            target_base = self.APPROACH_WITHOUT_DISTANCE
+            distance_to_correct = True
+        else:
+            target_base = max(-self.MAX_BASE, min(self.MAX_BASE, distance_error * self.KP_DIST))
+            distance_to_correct = abs(distance_error) > self.DEAD_ZONE_DIST
         target_turn = max(-self.MAX_TURN, min(self.MAX_TURN, x_error * self.KP_TURN))
 
-        if abs(x_error) > self.DEAD_ZONE_X or abs(distance_error) > self.DEAD_ZONE_DIST:
+        if abs(x_error) > self.DEAD_ZONE_X or distance_to_correct:
             self._cur_base = self._ramp(self._cur_base, target_base, self.MAX_STEP_ACC)
             self._cur_turn = self._ramp(self._cur_turn, target_turn, self.MAX_STEP_TURN)
             left  = self._cur_base + self._cur_turn

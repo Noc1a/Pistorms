@@ -271,6 +271,62 @@ class Odometry(Sensor):
             time.sleep(max(0.0, self.PERIOD - elapsed))
 
 
+class CameraTiming:
+    """How late the camera's detections are, printed every PERIOD_SECS as a
+    [CAMERA] line (durations only, nothing saved):
+      image age when read       from the end of the image's exposure
+                                (metadata SensorTimestamp, same clock as
+                                time.monotonic) to Python receiving it
+      image age when published  … to the detection handed to the controller
+      DNN on the chip           the IMX500's own inference time (CnnKpiInfo)
+    Frames without a detection output (the chip's network not done) are
+    counted apart."""
+
+    PERIOD_SECS = 2.0
+
+    def __init__(self) -> None:
+        self._start_new_period(time.monotonic())
+
+    def _start_new_period(self, now: float) -> None:
+        self._period_start: float = now
+        self._frames_with_output: int = 0
+        self._frames_without_output: int = 0
+        self._read_ages_ms: list[float] = []
+        self._published_ages_ms: list[float] = []
+        self._dnn_ms: list[float] = []
+
+    def frame_without_output(self) -> None:
+        self._frames_without_output += 1
+
+    def frame(self, exposure_end_ns: Optional[int], read_ns: int, published_ns: int,
+              kpi: Optional[tuple[float, float]]) -> None:
+        self._frames_with_output += 1
+        if exposure_end_ns is not None:
+            self._read_ages_ms.append((read_ns - exposure_end_ns) / 1e6)
+            self._published_ages_ms.append((published_ns - exposure_end_ns) / 1e6)
+        if kpi is not None:
+            self._dnn_ms.append(kpi[0])
+
+    def print_if_due(self, web_viewer: bool) -> None:
+        now = time.monotonic()
+        elapsed = now - self._period_start
+        if elapsed < self.PERIOD_SECS:
+            return
+
+        def average_and_max(values: list[float]) -> str:
+            if not values:
+                return "--"
+            return f"avg {sum(values) / len(values):4.0f} ms, max {max(values):4.0f}"
+
+        rate = self._frames_with_output / elapsed
+        dnn = f"{sum(self._dnn_ms) / len(self._dnn_ms):.0f} ms" if self._dnn_ms else "--"
+        print(f"[CAMERA] {rate:4.1f} detections/s ({self._frames_without_output} frames without)"
+              f" | image age read: {average_and_max(self._read_ages_ms)}"
+              f" | published: {average_and_max(self._published_ages_ms)}"
+              f" | DNN on chip {dnn} | web viewer {'yes' if web_viewer else 'no'}", flush=True)
+        self._start_new_period(now)
+
+
 class Camera(Sensor):
     """The IMX500 AI camera: detects objects (SSD MobileNetV2, on the camera
     itself), and publishes where the followed one is (state.targetPose) and
@@ -309,6 +365,7 @@ class Camera(Sensor):
         )
         self.picam2.configure(config)
         self._forget_target()
+        self._timing: CameraTiming = CameraTiming()
 
     def _forget_target(self) -> None:
         self._followed_heading: Optional[float] = None   # rad, same frame as state.pose
@@ -394,10 +451,26 @@ class Camera(Sensor):
             try: self.picam2.close()
             except Exception: pass
 
+    @staticmethod
+    def _image_time(metadata: dict) -> float:
+        """When the image was taken (time.monotonic() seconds): the end of its
+        exposure (SensorTimestamp, ns, the same clock), or now without it."""
+        exposure_end_ns = metadata.get('SensorTimestamp')
+        if exposure_end_ns is None:
+            return time.monotonic()
+        return exposure_end_ns / 1e9
+
+    def _web_viewer(self) -> bool:
+        """True while the web page asks for camera frames (JPEG encoding)."""
+        return time.monotonic() - self.state.last_frame_request <= self.FRAME_VIEWER_TIMEOUT
+
     def _process_frame(self, labels):
         metadata = self.picam2.capture_metadata()
+        read_ns = time.monotonic_ns()
         outputs = self.imx500.get_outputs(metadata, add_batch=True)
         if outputs is None:
+            self._timing.frame_without_output()
+            self._timing.print_if_due(self._web_viewer())
             return
 
         # SSD outputs: [0]=boxes, [1]=scores, [2]=classes
@@ -427,10 +500,14 @@ class Camera(Sensor):
             deviation_deg = self._deviation_deg(best)
             self.state.target_heading_rad = self._heading_of(best, robot_heading)
             # Publish a NEW Pose in one assignment so readers never see the new
-            # timestamp paired with the old x/angle.
+            # timestamp paired with the old x/angle. Its time is when the
+            # image was taken: the Follow mode drives only on recent images.
             self.state.targetPose = Pose(target_x, 0, math.radians(deviation_deg),
-                                         pose_timestamp=time.monotonic())
+                                         pose_timestamp=self._image_time(metadata))
         self.state.last_detections = detections
+        self._timing.frame(metadata.get('SensorTimestamp'), read_ns, time.monotonic_ns(),
+                           self.imx500.get_kpi_info(metadata))
+        self._timing.print_if_due(self._web_viewer())
 
 
 class Lidar(Sensor):
@@ -439,6 +516,12 @@ class Lidar(Sensor):
     thread receives each scan, works out the target and front obstacle
     distances, keeps it for web_viz (state.last_scan) and hands it to the
     Slam thread."""
+
+    # The followed target's distance: the nearest point within this angle of
+    # its direction, closer than this. 2 m until 2026-11-22: farther, the
+    # Follow mode saw the person but had no distance, and didn't approach.
+    TARGET_HALF_ANGLE_DEG = 5
+    TARGET_MAX_MM         = 4000
 
     def __init__(self, state: RobotState, portName: Optional[str] = None):
         """portName: the LiDAR's serial port; by default the robot profile's
@@ -503,7 +586,7 @@ class Lidar(Sensor):
                     if quality == 0 or distance <= 0:
                         continue
                     angle_diff = abs((angle - lidar_target_angle + 180) % 360 - 180)
-                    if angle_diff <= 5 and distance < 2000:
+                    if angle_diff <= self.TARGET_HALF_ANGLE_DEG and distance < self.TARGET_MAX_MM:
                         min_target_distance = min(min_target_distance, distance)
                     is_front = angle <= 10 or angle >= 350
                     if is_front and distance < 300:
